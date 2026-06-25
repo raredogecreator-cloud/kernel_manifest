@@ -1,7 +1,13 @@
 <?xml version="1.0" encoding="UTF-8"?>
+<!--
+  OnePlus 15 (infiniti) Build Manifest — raredogecreator-cloud fork
+  Base: OnePlusOSS/kernel_manifest @ oneplus/sm8850
+  Modified: OnePlus repos point to raredogecreator-cloud forks
+  CLO/external deps: unchanged (pinned to upstream revisions)
+-->
 <manifest>
   <remote fetch="https://git.codelinaro.org/clo/la" name="clo-la"/>
-  <remote fetch="https://github.com/OnePlusOSS" name="origin"/>
+  <remote fetch="https://github.com/raredogecreator-cloud" name="origin"/>
   <default remote="clo-la" revision="dummy_revision" sync-c="true" sync-tags="false"/>
   <project remote="origin" name="android_kernel_common_oneplus_sm8850" path="kernel_platform/common" revision="oneplus/sm8850_b_16.0.0_oneplus_15">
     <linkfile dest="kernel_platform/.source_date_epoch_dir" src="."/>
