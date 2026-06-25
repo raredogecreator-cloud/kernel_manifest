@@ -53,23 +53,42 @@ jobs:
           git config --global user.name "CI"
           git config --global color.ui false
           mkdir -p op15-kernel && cd op15-kernel
-          repo init --depth=1 \
+
+          repo init \
             -u https://github.com/${{ github.repository_owner }}/kernel_manifest.git \
             -b oneplus/sm8850 \
             -m oneplus_15.xml \
             --repo-rev=v2.16
-          repo sync -c -j$(nproc) --no-tags --fail-fast --force-sync 2>&1 | tail -30
+
+          for attempt in 1 2 3; do
+            echo "=== Sync attempt $attempt ==="
+            if repo sync -c -j$(nproc) --no-tags --no-clone-bundle --force-sync 2>&1 | tee /tmp/sync_${attempt}.log | tail -30; then
+              echo "Sync succeeded on attempt $attempt"
+              break
+            else
+              echo "Sync failed on attempt $attempt"
+              if [ "$attempt" -eq 3 ]; then
+                echo "ERROR: All sync attempts failed"
+                cat /tmp/sync_${attempt}.log | grep -i "error\|fatal\|cannot" | tail -20
+                exit 1
+              fi
+              sleep 15
+            fi
+          done
+
           echo ""
           echo "=== Sync complete ==="
           df -h /
           echo ""
           echo "=== Build script check ==="
-          ls -la kernel_platform/oplus/build/oplus_build_kernel.sh 2>/dev/null || echo "ERROR: build script not found"
+          ls -la kernel_platform/oplus/build/oplus_build_kernel.sh || { echo "ERROR: build script not found"; exit 1; }
           echo ""
           echo "=== kernel_platform/common HEAD ==="
           git -C kernel_platform/common log --oneline -1
           echo "=== kernel_platform/soc-repo HEAD ==="
           git -C kernel_platform/soc-repo log --oneline -1
+          echo "=== modules_and_devicetree HEAD ==="
+          git log --oneline -1
 
       - name: Verify source is clean (no root framework)
         run: |
@@ -90,9 +109,10 @@ jobs:
           cd op15-kernel
           chmod +x kernel_platform/oplus/build/*.sh
           echo "=== Build start: $(date -u) ==="
-          ./kernel_platform/oplus/build/oplus_build_kernel.sh canoe perf 2>&1 | tee build.log | tail -100
+          ./kernel_platform/oplus/build/oplus_build_kernel.sh canoe perf 2>&1 | tee build.log
+          BUILD_EXIT=${PIPESTATUS[0]}
           echo ""
-          echo "=== Build exit code: ${PIPESTATUS[0]} ==="
+          echo "=== Build exit code: $BUILD_EXIT ==="
           echo "=== Build end: $(date -u) ==="
           echo ""
           echo "=== Searching for kernel image ==="
@@ -104,13 +124,18 @@ jobs:
             ls -la "$DIST/"
           fi
           df -h /
+          if [ "$BUILD_EXIT" -ne 0 ]; then
+            echo ""
+            echo "=== BUILD FAILED — last 50 errors ==="
+            grep -i "error\|fatal\|failed\|undefined\|cannot" build.log | tail -50
+            exit $BUILD_EXIT
+          fi
 
       - name: Collect build artifacts
         run: |
           cd op15-kernel
           mkdir -p artifacts
 
-          # Find kernel image
           for name in Image Image.gz Image.lz4 Image.gz-dtb; do
             IMG=$(find kernel_platform/out -name "$name" -not -path "*/dts/*" | head -1)
             if [ -n "$IMG" ]; then
@@ -119,7 +144,6 @@ jobs:
             fi
           done
 
-          # Collect .config
           CONF=$(find kernel_platform/out -name '.config' | head -1)
           if [ -n "$CONF" ]; then
             cp "$CONF" artifacts/kernel_built_config
@@ -130,16 +154,13 @@ jobs:
             grep -E 'CONFIG_KSU|CONFIG_KPM|SUSFS' "$CONF" && echo "ERROR: root config in build" || echo "Clean"
           fi
 
-          # Module.symvers + DTBs
           find kernel_platform/out -name 'Module.symvers' -exec cp {} artifacts/ \; 2>/dev/null || true
           find kernel_platform/out -name '*.dtb' -not -path "*/dts/*" | head -5 | while read dtb; do
             cp "$dtb" artifacts/ 2>/dev/null || true
           done
 
-          # Build log tail
           tail -500 build.log > artifacts/build_tail.log 2>/dev/null || true
 
-          # Hash everything
           cd artifacts
           sha256sum * 2>/dev/null | tee SHA256SUMS.txt
           ls -la
