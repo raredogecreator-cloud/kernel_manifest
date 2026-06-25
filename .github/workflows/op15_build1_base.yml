@@ -1,0 +1,172 @@
+name: OnePlus 15 Build 1 — Stock-equivalent base kernel
+
+# Build 1: Official OnePlus 15 source, canoe perf config.
+# No SukiSU, SUSFS, KPM, stealth patches, or performance tuning.
+# Purpose: prove source, toolchain, KMI, vendor modules, packaging.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Free disk space
+        run: |
+          echo "=== Before cleanup ==="
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/boost /usr/share/swift \
+            /usr/local/julia* /opt/hostedtoolcache/go \
+            /opt/hostedtoolcache/Ruby /opt/hostedtoolcache/node || true
+          sudo docker image prune --all --force || true
+          echo "=== After cleanup ==="
+          df -h /
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ca-certificates cpio curl flex git \
+            kmod libelf-dev libssl-dev lz4 python3 python-is-python3 \
+            zip zstd rsync ccache
+          mkdir -p ~/bin
+          curl -s https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+          chmod a+x ~/bin/repo
+          echo "$HOME/bin" >> $GITHUB_PATH
+
+      - name: Record source SHAs (pre-sync)
+        run: |
+          echo "=== Source branch: oneplus/sm8850_b_16.0.0_oneplus_15 ==="
+          for repo in android_kernel_common_oneplus_sm8850 android_kernel_oneplus_sm8850 android_kernel_modules_and_devicetree_oneplus_sm8850; do
+            SHA=$(curl -sH "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              "https://api.github.com/repos/${{ github.repository_owner }}/$repo/commits?sha=oneplus/sm8850_b_16.0.0_oneplus_15&per_page=1" \
+              | python3 -c "import sys,json; print(json.load(sys.stdin)[0]['sha'][:7])" 2>/dev/null || echo "FETCH_FAILED")
+            echo "$repo: $SHA"
+          done
+
+      - name: Sync kernel tree (repo init + sync)
+        run: |
+          git config --global user.email "ci@build.local"
+          git config --global user.name "CI"
+          git config --global color.ui false
+          mkdir -p op15-kernel && cd op15-kernel
+          repo init --depth=1 \
+            -u https://github.com/${{ github.repository_owner }}/kernel_manifest.git \
+            -b oneplus/sm8850 \
+            -m oneplus_15.xml \
+            --repo-rev=v2.16
+          repo sync -c -j$(nproc) --no-tags --fail-fast --force-sync 2>&1 | tail -30
+          echo ""
+          echo "=== Sync complete ==="
+          df -h /
+          echo ""
+          echo "=== Build script check ==="
+          ls -la kernel_platform/oplus/build/oplus_build_kernel.sh 2>/dev/null || echo "ERROR: build script not found"
+          echo ""
+          echo "=== kernel_platform/common HEAD ==="
+          git -C kernel_platform/common log --oneline -1
+          echo "=== kernel_platform/soc-repo HEAD ==="
+          git -C kernel_platform/soc-repo log --oneline -1
+
+      - name: Verify source is clean (no root framework)
+        run: |
+          cd op15-kernel
+          echo "=== Verify no SukiSU/SUSFS/KPM in source ==="
+          FOUND=0
+          for pattern in CONFIG_KSU CONFIG_KPM SUSFS KernelSU SukiSU; do
+            COUNT=$(grep -r "$pattern" kernel_platform/common/fs/ kernel_platform/common/kernel/ kernel_platform/common/security/ 2>/dev/null | wc -l)
+            if [ "$COUNT" -gt 0 ]; then
+              echo "WARNING: $pattern found $COUNT times"
+              FOUND=1
+            fi
+          done
+          [ "$FOUND" -eq 0 ] && echo "Source clean: no root framework references"
+
+      - name: Build kernel (canoe perf)
+        run: |
+          cd op15-kernel
+          chmod +x kernel_platform/oplus/build/*.sh
+          echo "=== Build start: $(date -u) ==="
+          ./kernel_platform/oplus/build/oplus_build_kernel.sh canoe perf 2>&1 | tee build.log | tail -100
+          echo ""
+          echo "=== Build exit code: ${PIPESTATUS[0]} ==="
+          echo "=== Build end: $(date -u) ==="
+          echo ""
+          echo "=== Searching for kernel image ==="
+          find kernel_platform/out -name 'Image' -o -name 'Image.gz' -o -name 'Image.lz4' -o -name 'Image.gz-dtb' 2>/dev/null | head -10
+          echo ""
+          DIST=$(find kernel_platform/out -type d -name 'dist' | head -1)
+          if [ -n "$DIST" ]; then
+            echo "=== Dist contents ==="
+            ls -la "$DIST/"
+          fi
+          df -h /
+
+      - name: Collect build artifacts
+        run: |
+          cd op15-kernel
+          mkdir -p artifacts
+
+          # Find kernel image
+          for name in Image Image.gz Image.lz4 Image.gz-dtb; do
+            IMG=$(find kernel_platform/out -name "$name" -not -path "*/dts/*" | head -1)
+            if [ -n "$IMG" ]; then
+              echo "Found: $IMG ($(stat -c%s "$IMG") bytes)"
+              cp "$IMG" artifacts/
+            fi
+          done
+
+          # Collect .config
+          CONF=$(find kernel_platform/out -name '.config' | head -1)
+          if [ -n "$CONF" ]; then
+            cp "$CONF" artifacts/kernel_built_config
+            echo "=== Config verification ==="
+            grep -E '^CONFIG_LOCALVERSION' "$CONF" || echo "LOCALVERSION not set"
+            grep -E '^CONFIG_MODULES=|^CONFIG_MODVERSIONS=' "$CONF" || true
+            echo "--- Verify NO root framework ---"
+            grep -E 'CONFIG_KSU|CONFIG_KPM|SUSFS' "$CONF" && echo "ERROR: root config in build" || echo "Clean"
+          fi
+
+          # Module.symvers + DTBs
+          find kernel_platform/out -name 'Module.symvers' -exec cp {} artifacts/ \; 2>/dev/null || true
+          find kernel_platform/out -name '*.dtb' -not -path "*/dts/*" | head -5 | while read dtb; do
+            cp "$dtb" artifacts/ 2>/dev/null || true
+          done
+
+          # Build log tail
+          tail -500 build.log > artifacts/build_tail.log 2>/dev/null || true
+
+          # Hash everything
+          cd artifacts
+          sha256sum * 2>/dev/null | tee SHA256SUMS.txt
+          ls -la
+
+      - name: Verify kernel image produced
+        run: |
+          cd op15-kernel/artifacts
+          ls Image Image.gz Image.lz4 Image.gz-dtb 2>/dev/null || {
+            echo "ERROR: No kernel image produced — Build 1 FAILED"
+            grep -i "error\|fatal\|failed" ../build.log | tail -30
+            exit 1
+          }
+          echo "Build 1 kernel image present"
+
+      - name: Upload Build 1 artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: op15-build1-base-kernel
+          path: op15-kernel/artifacts/*
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Upload full build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: op15-build1-full-log
+          path: op15-kernel/build.log
+          retention-days: 14
+          if-no-files-found: warn
