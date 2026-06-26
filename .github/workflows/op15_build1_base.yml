@@ -73,7 +73,7 @@ jobs:
           from concurrent.futures import ThreadPoolExecutor
 
           NPROC = int(subprocess.check_output("nproc", shell=True).strip())
-          MAX_WORKERS = (os.cpu_count() or 2) * 4
+          MAX_WORKERS = 4  # Low parallelism to avoid CLO rate limits
 
           aria2_headers = (
               "--header='User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -88,7 +88,7 @@ jobs:
                   os.makedirs(path, exist_ok=True)
 
               start_time = time.time()
-              MAX_ATTEMPTS = 3
+              MAX_ATTEMPTS = 5
               for attempt in range(1, MAX_ATTEMPTS + 1):
                   shm_workspace = f"/dev/shm/sync_{hash(name) % 1000000}"
                   if os.path.exists(shm_workspace):
@@ -105,7 +105,9 @@ jobs:
                           f"-d {shm_workspace} -o {archive_file} "
                           f"--summary-interval=0 {aria2_headers} '{url}'"
                       )
-                      subprocess.run(aria_cmd, shell=True, check=True, capture_output=True)
+                      result = subprocess.run(aria_cmd, shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                      if result.returncode != 0:
+                          raise subprocess.CalledProcessError(result.returncode, aria_cmd, output=result.stdout)
 
                       extract_cmd = (
                           f"tar -I 'pigz -p {NPROC}' -x "
@@ -117,10 +119,10 @@ jobs:
                       print(f"  [OK] {name} ({duration:.1f}s)")
                       return True
                   except subprocess.CalledProcessError as e:
-                      stderr = e.stderr.decode() if e.stderr else "no stderr"
-                      print(f"  [FAIL] {name} attempt {attempt}: {stderr[:200]}")
+                      output = (e.stderr or e.stdout or e.output or b"").decode(errors="replace")
+                      print(f"  [FAIL] {name} attempt {attempt}: {output[-300:]}")
                       if attempt < MAX_ATTEMPTS:
-                          time.sleep(5)
+                          time.sleep(10 * attempt)  # backoff: 10s, 20s, 30s, 40s
                   finally:
                       if os.path.exists(shm_workspace):
                           shutil.rmtree(shm_workspace, ignore_errors=True)
