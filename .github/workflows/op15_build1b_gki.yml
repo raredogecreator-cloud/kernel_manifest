@@ -72,7 +72,7 @@ jobs:
             -o source.tar.gz "https://github.com/${REPO}/archive/${SOURCE_SHA}.tar.gz"
 
           mkdir -p common
-          tar -I 'pigz -p $(nproc)' -x -f source.tar.gz -C common --strip-components=1
+          tar -I "pigz -p $(nproc)" -x -f source.tar.gz -C common --strip-components=1
           rm source.tar.gz
 
           ls common/arch/arm64/configs/gki_defconfig && echo "gki_defconfig: present"
