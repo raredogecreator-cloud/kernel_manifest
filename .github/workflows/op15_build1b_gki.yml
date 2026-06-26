@@ -52,7 +52,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             bc bison build-essential ca-certificates cpio curl flex git \
             kmod libelf-dev libssl-dev lz4 python3 python-is-python3 \
-            zip zstd rsync ccache aria2 pigz pahole
+            zip zstd rsync ccache aria2 pigz pahole libdw-dev elfutils dwarves
 
       - name: Download source and toolchains
         run: |
