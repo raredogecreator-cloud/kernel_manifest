@@ -140,6 +140,12 @@ jobs:
           def_remote = default.get("remote") if default is not None else None
           def_rev = default.get("revision") if default is not None else None
 
+          # Host-side test infrastructure — not on CLO (404), not needed for kernel build
+          SKIP_PROJECTS = {
+              "kernel_platform/prebuilts/asuite",
+              "kernel_platform/tools/tradefederation/prebuilts",
+          }
+
           sync_tasks = []
           post_process_data = []
 
@@ -151,6 +157,10 @@ jobs:
               base_url = remotes.get(remote_name)
 
               if not base_url:
+                  continue
+
+              if name in SKIP_PROJECTS:
+                  print(f"  [SKIP] {name} (host-side test infra, not on CLO)")
                   continue
 
               if "github.com" in base_url:
