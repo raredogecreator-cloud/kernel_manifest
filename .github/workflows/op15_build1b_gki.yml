@@ -221,7 +221,7 @@ jobs:
 
           # Verify outputs
           test -s out/arch/arm64/boot/Image || { echo "FATAL: Image not produced"; exit 1; }
-          test -s out/Module.symvers || { echo "FATAL: Module.symvers missing"; exit 1; }
+          test -s out/vmlinux.symvers || { echo "FATAL: vmlinux.symvers missing"; exit 1; }
 
           echo "=== Build end: $(date -u) ==="
           echo "Image: $(stat -c%s out/arch/arm64/boot/Image) bytes"
@@ -236,7 +236,7 @@ jobs:
 
           cp out/arch/arm64/boot/Image "$WORKDIR/artifacts/"
           cp out/.config "$WORKDIR/artifacts/kernel_built_config"
-          cp out/Module.symvers "$WORKDIR/artifacts/"
+          cp out/vmlinux.symvers "$WORKDIR/artifacts/"
           cp out/System.map "$WORKDIR/artifacts/" 2>/dev/null || true
           cp out/modules.builtin "$WORKDIR/artifacts/" 2>/dev/null || true
           cp out/modules.builtin.modinfo "$WORKDIR/artifacts/" 2>/dev/null || true
