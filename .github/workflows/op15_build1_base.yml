@@ -233,6 +233,18 @@ jobs:
           echo ""
           df -h /
 
+      - name: Initialize git repos (Bazel workspace status needs .git)
+        run: |
+          cd op15-kernel
+          for dir in . kernel_platform/common kernel_platform/soc-repo; do
+            if [ -d "$dir" ] && [ ! -d "$dir/.git" ]; then
+              git -C "$dir" init -q
+              git -C "$dir" add -A > /dev/null 2>&1 || true
+              git -C "$dir" -c user.email=ci@build -c user.name=CI commit -q -m "source" --allow-empty
+              echo "git init: $dir"
+            fi
+          done
+
       - name: Verify source integrity
         run: |
           cd op15-kernel
