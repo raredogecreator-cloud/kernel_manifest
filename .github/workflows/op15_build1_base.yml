@@ -334,7 +334,7 @@ jobs:
       - name: Verify kernel image produced
         run: |
           cd op15-kernel/artifacts
-          ls Image Image.gz Image.lz4 Image.gz-dtb 2>/dev/null || {
+          FOUND=$(ls Image Image.gz Image.lz4 Image.gz-dtb 2>/dev/null | head -1); [ -n "$FOUND" ] || {
             echo "ERROR: No kernel image produced — Build 1 FAILED"
             grep -i "error\|fatal\|failed" ../build.log | tail -30
             exit 1
