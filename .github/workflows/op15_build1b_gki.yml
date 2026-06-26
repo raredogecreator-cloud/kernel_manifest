@@ -1,13 +1,22 @@
 name: OnePlus 15 Build 1B — GKI base kernel
 
-# Build 1B: Official OnePlus 15 common kernel source, gki_defconfig.
-# Pure GKI Image — no appended DTB, no Bazel, no oplus wrapper.
-# Stock DTB preserved during AnyKernel3/magiskboot repack.
-# Method: verified against Numbersf, cctv18, WildKernels (all use this path).
-# Toolchain: clang r536225 + Rust 1.82.0 + build-tools (same as cctv18).
+# Official OnePlus .201/.202 common source built using community-derived
+# direct-GKI procedure. Pure Image, no Bazel/oplus wrapper, no appended DTB.
+# Stock .300 kernel_dtb preserved during magiskboot repack.
+# Toolchain: clang r536225 + Rust 1.82.0 + build-tools (cctv18 release).
 
 on:
   workflow_dispatch:
+
+env:
+  SOURCE_REPO: OnePlusOSS/android_kernel_common_oneplus_sm8850
+  SOURCE_SHA: d9053b907db4bb5da938e9cf947d0ae32302ceaf
+  SOURCE_BRANCH: oneplus/sm8850_b_16.0.0_oneplus_15
+  TOOLCHAIN_BASE: https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang19-r536225
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
   build:
@@ -16,10 +25,10 @@ jobs:
     steps:
       - name: Disk cleanup
         run: |
-          echo "=== Before cleanup ==="
+          set -euo pipefail
           df -h /
           mkdir -p /tmp/.background_trash/{1..10}
-          safe_mv() { [ -e "$1" ] && sudo mv "$1" "$2"; }
+          safe_mv() { [ -e "$1" ] && sudo mv "$1" "$2" || true; }
           export -f safe_mv
           safe_mv /usr/share/dotnet /tmp/.background_trash/1 &
           safe_mv /usr/local/lib/android /tmp/.background_trash/2 &
@@ -32,144 +41,120 @@ jobs:
           safe_mv /opt/hostedtoolcache/node /tmp/.background_trash/9 &
           sudo bash -c 'mv /usr/local/julia* /tmp/.background_trash/10 2>/dev/null || true' &
           wait
-          (
-            sudo nice -n 19 ionice -c 3 rm -rf /tmp/.background_trash
-            sudo apt-get purge -y firefox google-chrome-stable microsoft-edge-stable > /dev/null 2>&1 || true
-            sudo docker image prune --all --force > /dev/null 2>&1 || true
-          ) > /dev/null 2>&1 &
+          sudo nice -n 19 ionice -c 3 rm -rf /tmp/.background_trash &
           disown
-          echo "=== After cleanup ==="
           df -h /
 
       - name: Install dependencies
         run: |
+          set -euo pipefail
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
             bc bison build-essential ca-certificates cpio curl flex git \
             kmod libelf-dev libssl-dev lz4 python3 python-is-python3 \
             zip zstd rsync ccache aria2 pigz pahole
 
-      - name: Download common kernel source
+      - name: Download source and toolchains
         run: |
-          mkdir -p kernel_workspace && cd kernel_workspace
+          set -euo pipefail
+          mkdir -p kernel_workspace
+          cd kernel_workspace
+          WORKDIR="$(pwd)"
+          echo "WORKDIR=$WORKDIR" >> "$GITHUB_ENV"
 
-          echo "=== Downloading OnePlus 15 common kernel source ==="
-          BRANCH="oneplus/sm8850_b_16.0.0_oneplus_15"
-          REPO="OnePlusOSS/android_kernel_common_oneplus_sm8850"
-          URL="https://github.com/${REPO}/archive/refs/heads/${BRANCH}.tar.gz"
+          echo "=== Source: $SOURCE_REPO @ $SOURCE_SHA ==="
 
-          # Record the source commit SHA for reproducibility
-          SOURCE_SHA=$(curl -sH "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            "https://api.github.com/repos/${REPO}/commits?sha=${BRANCH}&per_page=1" \
-            | python3 -c "import sys,json; print(json.load(sys.stdin)[0]['sha'])")
-          echo "Source commit: $SOURCE_SHA"
-          echo "SOURCE_SHA=$SOURCE_SHA" >> $GITHUB_ENV
-
-          # Download by exact commit SHA, not branch (prevents race if branch moves)
+          # Parallel downloads
           aria2c -x16 -s16 -k1M --retry-wait=5 --max-tries=10 \
-            --summary-interval=0 \
-            --header='User-Agent: Mozilla/5.0' \
-            -o source.tar.gz "https://github.com/${REPO}/archive/${SOURCE_SHA}.tar.gz"
+            --summary-interval=0 --header='User-Agent: Mozilla/5.0' \
+            -o source.tar.gz "https://github.com/${SOURCE_REPO}/archive/${SOURCE_SHA}.tar.gz" &
+          PID_SRC=$!
 
+          aria2c -x16 -s16 -k1M --retry-wait=5 --max-tries=5 \
+            --summary-interval=0 -o clang.zip "${TOOLCHAIN_BASE}/clang-r536225.zip" &
+          PID_CLG=$!
+
+          aria2c -x16 -s16 -k1M --retry-wait=5 --max-tries=5 \
+            --summary-interval=0 -o rust.zip "${TOOLCHAIN_BASE}/rust.zip" &
+          PID_RST=$!
+
+          aria2c -x16 -s16 -k1M --retry-wait=5 --max-tries=5 \
+            --summary-interval=0 -o build-tools.zip "${TOOLCHAIN_BASE}/build-tools.zip" &
+          PID_BT=$!
+
+          wait $PID_SRC || { echo "FATAL: source download failed"; exit 1; }
+          wait $PID_CLG || { echo "FATAL: clang download failed"; exit 1; }
+          wait $PID_RST || { echo "FATAL: rust download failed"; exit 1; }
+          wait $PID_BT  || { echo "FATAL: build-tools download failed"; exit 1; }
+          echo "All downloads complete"
+
+          # Sequential extraction
+          echo "Extracting source..."
           mkdir -p common
           tar -I "pigz -p $(nproc)" -x -f source.tar.gz -C common --strip-components=1
           rm source.tar.gz
 
-          ls common/arch/arm64/configs/gki_defconfig && echo "gki_defconfig: present"
-          df -h /
-
-      - name: Download toolchains (clang r536225 + Rust + build-tools)
-        run: |
-          cd kernel_workspace
-
-          # Same toolchain set cctv18 uses — clang r536225, Rust 1.82.0, build-tools
-          TOOLCHAIN_BASE="https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang19-r536225"
-
-          echo "=== Downloading clang r536225 ==="
-          aria2c -x16 -s16 -k1M --retry-wait=5 --max-tries=5 \
-            --summary-interval=0 -o clang.zip "${TOOLCHAIN_BASE}/clang-r536225.zip"
+          echo "Extracting clang..."
           mkdir -p clang19
           unzip -q clang.zip -d clang19
           rm clang.zip
 
-          echo "=== Downloading Rust 1.82.0 ==="
-          aria2c -x16 -s16 -k1M --retry-wait=5 --max-tries=5 \
-            --summary-interval=0 -o rust.zip "${TOOLCHAIN_BASE}/rust.zip"
+          echo "Extracting rust..."
           mkdir -p rust
           unzip -q rust.zip -d rust
           rm rust.zip
 
-          echo "=== Downloading build-tools ==="
-          aria2c -x16 -s16 -k1M --retry-wait=5 --max-tries=5 \
-            --summary-interval=0 -o build-tools.zip "${TOOLCHAIN_BASE}/build-tools.zip"
+          echo "Extracting build-tools..."
           unzip -q build-tools.zip
           rm build-tools.zip
 
-          echo "=== Verify toolchains ==="
-          CLANG_BIN=$(find clang19 -name 'clang' -path '*/bin/clang' | head -1)
-          echo "Clang binary: $CLANG_BIN"
-          $CLANG_BIN --version | head -3
+          # Verify critical files
+          test -f common/arch/arm64/configs/gki_defconfig || { echo "FATAL: gki_defconfig missing"; exit 1; }
+          test -f common/Makefile || { echo "FATAL: kernel Makefile missing"; exit 1; }
 
-          RUSTC_BIN=$(find rust -name 'rustc' -path '*/bin/rustc' | head -1)
-          echo "Rustc binary: $RUSTC_BIN"
-          $RUSTC_BIN --version
+          # Absolute toolchain paths
+          export PATH="$WORKDIR/clang19/bin:$WORKDIR/build-tools/bin:$WORKDIR/rust/bin:$PATH"
+          echo "PATH=$WORKDIR/clang19/bin:$WORKDIR/build-tools/bin:$WORKDIR/rust/bin:$PATH" >> "$GITHUB_ENV"
+          echo "LIBCLANG_PATH=$WORKDIR/clang19/lib" >> "$GITHUB_ENV"
 
-          BINDGEN_BIN=$(find rust build-tools clang19 -name 'bindgen' 2>/dev/null | head -1)
-          [ -z "$BINDGEN_BIN" ] && BINDGEN_BIN=$(which bindgen 2>/dev/null || true)
-          echo "Bindgen: ${BINDGEN_BIN:-NOT FOUND}"
-
-          PAHOLE_BIN=$(find build-tools -name 'pahole' 2>/dev/null | head -1)
-          [ -z "$PAHOLE_BIN" ] && PAHOLE_BIN=$(which pahole 2>/dev/null || true)
-          echo "Pahole: $PAHOLE_BIN"
-
-          # Export paths for build step
-          CLANG_DIR=$(dirname "$CLANG_BIN")
-          RUST_DIR=$(dirname "$RUSTC_BIN")
-          BUILDTOOLS_DIR=$(find . -path '*/build-tools/bin' -type d | head -1 || echo "")
-          echo "CLANG_DIR=$CLANG_DIR" >> $GITHUB_ENV
-          echo "RUST_DIR=$RUST_DIR" >> $GITHUB_ENV
-          echo "BUILDTOOLS_DIR=$BUILDTOOLS_DIR" >> $GITHUB_ENV
-          echo "BINDGEN_BIN=$BINDGEN_BIN" >> $GITHUB_ENV
+          # Verify all required tools
+          echo "=== Toolchain verification ==="
+          command -v clang   && clang --version | head -1   || { echo "FATAL: clang missing"; exit 1; }
+          command -v ld.lld                                 || { echo "FATAL: ld.lld missing"; exit 1; }
+          command -v rustc   && rustc --version             || { echo "FATAL: rustc missing"; exit 1; }
+          command -v bindgen && bindgen --version           || { echo "FATAL: bindgen missing"; exit 1; }
+          command -v pahole  && pahole --version            || echo "WARN: pahole from system"
+          test -d "$WORKDIR/clang19/lib"                    || { echo "FATAL: LIBCLANG_PATH missing"; exit 1; }
 
           df -h /
 
-      - name: Prepare build config
+      - name: Build kernel
         run: |
-          cd kernel_workspace/common
+          set -euo pipefail
+          cd "$WORKDIR/common"
 
-          # Disable check_defconfig (all community builders do this)
-          if grep -q 'check_defconfig' build.config.gki 2>/dev/null; then
-            sed -i 's/check_defconfig//' build.config.gki
-            echo "Disabled check_defconfig in build.config.gki"
-          fi
+          # Reproducible build environment (from Kleaf _setup_env.sh)
+          export TZ=UTC
+          export LC_ALL=C
+          export SOURCE_DATE_EPOCH=1717397200
+          export KBUILD_BUILD_TIMESTAMP="$(date -u -d @$SOURCE_DATE_EPOCH '+%a %b %e %T UTC %Y')"
+          export KBUILD_BUILD_USER=build-user
+          export KBUILD_BUILD_HOST=build-host
+          export KBUILD_BUILD_VERSION=1
+          export KBUILD_GENDWARFKSYMS_STABLE=1
+          export LIBCLANG_PATH="$WORKDIR/clang19/lib"
 
-          echo "=== gki_defconfig key entries ==="
-          grep -E 'CONFIG_LOCALVERSION|CONFIG_RUST|CONFIG_MODULES|CONFIG_MODVERSIONS' arch/arm64/configs/gki_defconfig
+          echo "=== Build environment ==="
+          echo "KBUILD_GENDWARFKSYMS_STABLE=$KBUILD_GENDWARFKSYMS_STABLE"
+          echo "SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH"
+          echo "KBUILD_BUILD_TIMESTAMP=$KBUILD_BUILD_TIMESTAMP"
 
-      - name: Build kernel (GKI make)
-        run: |
-          cd kernel_workspace
+          # Prefix mapping — map PARENT workspace, not common/ (gendwarfksyms needs this)
+          ROOT_REAL_PATH="$WORKDIR"
+          MAP_FLAGS="-fdebug-prefix-map=$ROOT_REAL_PATH=. -fmacro-prefix-map=$ROOT_REAL_PATH=. -ffile-prefix-map=$ROOT_REAL_PATH=."
 
-          # Set up toolchain paths (detect actual bin dirs)
-          export PATH="${CLANG_DIR}:${RUST_DIR}:${BUILDTOOLS_DIR}:${PATH}"
-          export LIBCLANG_PATH="${CLANG_DIR}/../lib"
-
-          cd common
-
-          echo "=== Toolchain verification ==="
-          clang --version | head -1
-          rustc --version 2>/dev/null || echo "WARN: rustc not in PATH"
-          bindgen --version 2>/dev/null || echo "WARN: bindgen not in PATH"
-          pahole --version 2>/dev/null || echo "WARN: pahole not in PATH"
-
-          echo ""
-          echo "=== Build start: $(date -u) ==="
-
-          WORKSPACE="$(pwd)"
-
-          # Path remap flags (used by Numbersf/cctv18/WildKernels for 6.12 + Rust/KMI)
-          KCFLAGS="-fdebug-prefix-map=${WORKSPACE}=. -fmacro-prefix-map=${WORKSPACE}=. -ffile-prefix-map=${WORKSPACE}=. -no-canonical-prefixes -Wno-error -D__ANDROID_COMMON_KERNEL__"
-          KCPPFLAGS="-D__ANDROID_COMMON_KERNEL__"
+          KCFLAGS="$MAP_FLAGS -no-canonical-prefixes -Wno-error -D__ANDROID_COMMON_KERNEL__"
+          KCPPFLAGS="$MAP_FLAGS -D__ANDROID_COMMON_KERNEL__"
 
           MAKE_ARGS=(
             LLVM=1
@@ -183,128 +168,111 @@ jobs:
             OBJCOPY="llvm-objcopy"
             OBJDUMP="llvm-objdump"
             STRIP="llvm-strip"
+            HOSTCC="clang"
+            HOSTCXX="clang++"
+            HOSTLD="ld.lld"
             KCFLAGS="$KCFLAGS"
             KCPPFLAGS="$KCPPFLAGS"
           )
 
-          # Add Rust/bindgen if available
-          if command -v rustc &>/dev/null; then
-            MAKE_ARGS+=(RUSTC="$(which rustc)")
-          fi
-          if [ -n "$BINDGEN_BIN" ] && [ -f "$BINDGEN_BIN" ]; then
-            MAKE_ARGS+=(BINDGEN="$BINDGEN_BIN")
-          fi
-          if command -v pahole &>/dev/null; then
-            MAKE_ARGS+=(PAHOLE="$(which pahole)")
-          fi
+          command -v rustc &>/dev/null && MAKE_ARGS+=(RUSTC="$(command -v rustc)")
+          command -v bindgen &>/dev/null && MAKE_ARGS+=(BINDGEN="$(command -v bindgen)")
+          command -v pahole &>/dev/null && MAKE_ARGS+=(PAHOLE="$(command -v pahole)")
 
-          # Generate config
-          make -j$(nproc) O=out "${MAKE_ARGS[@]}" gki_defconfig
-          make -j$(nproc) O=out "${MAKE_ARGS[@]}" olddefconfig
+          echo "=== Build start: $(date -u) ==="
 
-          # Check kernelrelease BEFORE building
+          # Config
+          make -j"$(nproc)" O=out "${MAKE_ARGS[@]}" gki_defconfig
+
+          # Verify Rust toolchain
+          make O=out "${MAKE_ARGS[@]}" rustavailable || { echo "FATAL: Rust toolchain check failed"; exit 1; }
+
+          make -j"$(nproc)" O=out "${MAKE_ARGS[@]}" olddefconfig
+
+          # Enforce required config symbols
+          REQUIRED=(
+            "CONFIG_MODULES=y"
+            "CONFIG_MODVERSIONS=y"
+            "CONFIG_GENDWARFKSYMS=y"
+            "CONFIG_RUST=y"
+            "CONFIG_DEBUG_INFO_BTF=y"
+          )
+          for symbol in "${REQUIRED[@]}"; do
+            grep -qx "$symbol" out/.config || { echo "FATAL: missing $symbol"; exit 1; }
+          done
+
+          # Reject root framework
+          if grep -qE '^CONFIG_KSU=|^CONFIG_KPM=|^CONFIG_KSU_SUSFS=' out/.config; then
+            echo "FATAL: root framework config found"
+            grep -E '^CONFIG_KSU|^CONFIG_KPM|^CONFIG_KSU_SUSFS' out/.config
+            exit 1
+          fi
+          echo "Config validated"
+
+          # Kernelrelease
           KERNELRELEASE=$(make -s O=out "${MAKE_ARGS[@]}" kernelrelease)
-          echo ""
           echo "=== Kernel release: $KERNELRELEASE ==="
           echo "=== Stock .300:     6.12.23-android16-5-gb2a876903b49-ab14541642-4k ==="
-          echo "KERNELRELEASE=$KERNELRELEASE" >> $GITHUB_ENV
-          echo ""
+          echo "KERNELRELEASE=$KERNELRELEASE" >> "$GITHUB_ENV"
 
-          # Build kernel Image
-          make -j$(nproc) O=out "${MAKE_ARGS[@]}" Image 2>&1 | tee build.log
-          BUILD_EXIT=${PIPESTATUS[0]}
+          # Build
+          make -j"$(nproc)" O=out "${MAKE_ARGS[@]}" Image 2>&1 | tee build.log
+          test "${PIPESTATUS[0]}" -eq 0 || { echo "FATAL: build failed"; grep -i "error:" build.log | tail -30; exit 1; }
 
-          echo ""
-          echo "=== Build exit code: $BUILD_EXIT ==="
+          # Verify outputs
+          test -s out/arch/arm64/boot/Image || { echo "FATAL: Image not produced"; exit 1; }
+          test -s out/Module.symvers || { echo "FATAL: Module.symvers missing"; exit 1; }
+
           echo "=== Build end: $(date -u) ==="
-
-          if [ "$BUILD_EXIT" -ne 0 ]; then
-            echo "=== BUILD FAILED ==="
-            grep -i "error:" build.log | tail -30
-            exit 1
-          fi
-
-          # Verify Image exists and is pure (no appended DTB)
-          IMAGE="out/arch/arm64/boot/Image"
-          ls -la "$IMAGE" || { echo "ERROR: Image not produced"; exit 1; }
-          IMAGE_SIZE=$(stat -c%s "$IMAGE")
-          echo ""
-          echo "=== Image details ==="
-          echo "Size: $IMAGE_SIZE bytes"
-          file "$IMAGE"
-          sha256sum "$IMAGE"
-
-          # Verify no DTB appended (GKI Image should be ~20MB, not ~40MB)
-          if [ "$IMAGE_SIZE" -gt 30000000 ]; then
-            echo "WARNING: Image is $IMAGE_SIZE bytes — may have appended DTB"
-            echo "Stock GKI kernel is ~20MB. Check if this is composite."
-          else
-            echo "Image size looks correct for pure GKI kernel"
-          fi
-          echo ""
+          echo "Image: $(stat -c%s out/arch/arm64/boot/Image) bytes"
+          sha256sum out/arch/arm64/boot/Image
           df -h /
 
-      - name: Collect build artifacts
+      - name: Collect artifacts
         run: |
-          cd kernel_workspace/common
-          mkdir -p ../../artifacts
+          set -euo pipefail
+          cd "$WORKDIR/common"
+          mkdir -p "$WORKDIR/artifacts"
 
-          # Kernel Image
-          cp out/arch/arm64/boot/Image ../../artifacts/
-          echo "Image: $(stat -c%s ../../artifacts/Image) bytes"
+          cp out/arch/arm64/boot/Image "$WORKDIR/artifacts/"
+          cp out/.config "$WORKDIR/artifacts/kernel_built_config"
+          cp out/Module.symvers "$WORKDIR/artifacts/"
+          cp out/System.map "$WORKDIR/artifacts/" 2>/dev/null || true
+          cp out/modules.builtin "$WORKDIR/artifacts/" 2>/dev/null || true
+          cp out/modules.builtin.modinfo "$WORKDIR/artifacts/" 2>/dev/null || true
+          tail -500 build.log > "$WORKDIR/artifacts/build_tail.log"
 
-          # Built config
-          cp out/.config ../../artifacts/kernel_built_config
-
-          echo "=== Config verification ==="
-          grep -E '^CONFIG_LOCALVERSION' out/.config || echo "LOCALVERSION not set"
-          grep -E '^CONFIG_MODULES=|^CONFIG_MODVERSIONS=' out/.config || true
-          grep -E '^CONFIG_RUST=' out/.config || echo "RUST not set"
-          echo "--- Verify NO root framework ---"
-          if grep -qE 'CONFIG_KSU|CONFIG_KPM|SUSFS' out/.config; then
-            echo "FATAL: root framework config found in Build 1B"
-            grep -E 'CONFIG_KSU|CONFIG_KPM|SUSFS' out/.config
-            exit 1
-          fi
-          echo "Clean: no root framework in config"
-
-          # Module.symvers
-          cp out/Module.symvers ../../artifacts/ 2>/dev/null || true
-
-          # Build log tail
-          tail -500 build.log > ../../artifacts/build_tail.log
-
-          # Record build metadata
-          cat > ../../artifacts/BUILD_INFO.txt << EOF
-          Source: OnePlusOSS/android_kernel_common_oneplus_sm8850
-          Branch: oneplus/sm8850_b_16.0.0_oneplus_15
+          cat > "$WORKDIR/artifacts/BUILD_INFO.txt" << INFOEOF
+          Source: ${{ env.SOURCE_REPO }}
+          Branch: ${{ env.SOURCE_BRANCH }}
           Commit: ${{ env.SOURCE_SHA }}
           Kernelrelease: ${{ env.KERNELRELEASE }}
-          Stock .300 release: 6.12.23-android16-5-gb2a876903b49-ab14541642-4k
-          Clang: r536225 (from cctv18 toolchain release)
+          Stock .300: 6.12.23-android16-5-gb2a876903b49-ab14541642-4k
+          Clang: $(clang --version | head -1)
+          Rustc: $(rustc --version 2>/dev/null)
+          KBUILD_GENDWARFKSYMS_STABLE: 1
+          Image size: $(stat -c%s "$WORKDIR/artifacts/Image") bytes
           Build date: $(date -u)
-          Build method: make gki_defconfig + make Image (GKI path)
-          EOF
+          Method: make gki_defconfig + make Image (direct GKI)
+          INFOEOF
 
-          # Hash everything
-          cd ../../artifacts
+          cd "$WORKDIR/artifacts"
           sha256sum * | tee SHA256SUMS.txt
-          echo ""
           ls -la
 
-      - name: Upload Build 1B artifacts
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: op15-build1b-gki-kernel
-          path: artifacts/*
+          path: ${{ github.workspace }}/kernel_workspace/artifacts/*
           retention-days: 30
           if-no-files-found: error
 
-      - name: Upload full build log
+      - name: Upload build log
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: op15-build1b-full-log
-          path: kernel_workspace/common/build.log
+          path: ${{ github.workspace }}/kernel_workspace/common/build.log
           retention-days: 14
           if-no-files-found: warn
