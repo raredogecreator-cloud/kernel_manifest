@@ -233,17 +233,24 @@ jobs:
           echo ""
           df -h /
 
-      - name: Initialize git repos (Bazel workspace status needs .git)
+      - name: Prepare build environment
         run: |
           cd op15-kernel
+
+          # Bazel BazelWorkspaceStatusAction runs git rev-parse at workspace root.
+          # Archive downloads have no .git — init minimal repos (empty commit only, no add).
           for dir in . kernel_platform/common kernel_platform/soc-repo; do
             if [ -d "$dir" ] && [ ! -d "$dir/.git" ]; then
               git -C "$dir" init -q
-              git -C "$dir" add -A > /dev/null 2>&1 || true
-              git -C "$dir" -c user.email=ci@build -c user.name=CI commit -q -m "source" --allow-empty
+              git -C "$dir" -c user.email=ci@build -c user.name=CI commit -q --allow-empty -m "archive-source"
               echo "git init: $dir"
             fi
           done
+
+          # oplus_setup.sh sets ANDROID_PRODUCT_OUT but doesn't mkdir it.
+          # mktemp in the build script fails without this directory.
+          mkdir -p out/target/product/canoe
+          echo "Created out/target/product/canoe"
 
       - name: Verify source integrity
         run: |
@@ -279,11 +286,15 @@ jobs:
             ls -la "$DIST/"
           fi
           df -h /
-          if [ "$BUILD_EXIT" -ne 0 ]; then
+          # oplus_build_kernel.sh swallows Bazel errors (exits 0 even on failure).
+          # Check both exit code AND log for actual build failure.
+          if [ "$BUILD_EXIT" -ne 0 ] || grep -q "Build did NOT complete successfully" build.log; then
             echo ""
-            echo "=== BUILD FAILED — last 50 errors ==="
+            echo "=== BUILD FAILED ==="
+            echo "Exit code: $BUILD_EXIT"
+            echo "=== Last 50 error lines ==="
             grep -i "error\|fatal\|failed\|undefined\|cannot" build.log | tail -50
-            exit $BUILD_EXIT
+            exit 1
           fi
 
       - name: Collect build artifacts
