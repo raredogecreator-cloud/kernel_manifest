@@ -157,6 +157,65 @@ jobs:
 
           KSU_VERSION=$(cd KernelSU && git rev-list --count HEAD 2>/dev/null || echo "unknown")
           echo "KSU commit count: $KSU_VERSION"
+
+          # --- 2b. Fix SukiSU lsm_hook.c for 6.12 LSM API ---
+          # Kernel 6.12 changed security_add_hooks() to take const struct lsm_id *
+          # instead of const char *. The builtin branch doesn't handle this.
+          LSM_FILE="KernelSU/kernel/hook/lsm_hook.c"
+          if [ -f "$LSM_FILE" ]; then
+            python3 << 'PYEOF'
+          import sys
+
+          filepath = "KernelSU/kernel/hook/lsm_hook.c"
+          with open(filepath, 'r') as f:
+              content = f.read()
+
+          old_block = '''#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0)
+    security_add_hooks(ksu_hooks, ARRAY_SIZE(ksu_hooks), "ksu");
+#else
+    // https://elixir.bootlin.com/linux/v4.10.17/source/include/linux/lsm_hooks.h#L1892
+    security_add_hooks(ksu_hooks, ARRAY_SIZE(ksu_hooks));
+#endif'''
+
+          new_block = '''#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+    security_add_hooks(ksu_hooks, ARRAY_SIZE(ksu_hooks), &ksu_lsm_id);
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0)
+    security_add_hooks(ksu_hooks, ARRAY_SIZE(ksu_hooks), "ksu");
+#else
+    // https://elixir.bootlin.com/linux/v4.10.17/source/include/linux/lsm_hooks.h#L1892
+    security_add_hooks(ksu_hooks, ARRAY_SIZE(ksu_hooks));
+#endif'''
+
+          lsm_id_def = '''
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+static const struct lsm_id ksu_lsm_id = {
+\t.name = "ksu",
+\t.id = 0,
+};
+#endif
+
+void __init ksu_lsm_hook_init(void)'''
+
+          if old_block not in content:
+              print(f"FATAL: Expected security_add_hooks block not found in {filepath}")
+              sys.exit(1)
+
+          content = content.replace(old_block, new_block)
+
+          old_func = 'void __init ksu_lsm_hook_init(void)'
+          count = content.count(old_func)
+          if count != 1:
+              print(f"FATAL: Found {count} occurrences of ksu_lsm_hook_init, expected 1")
+              sys.exit(1)
+
+          content = content.replace(old_func, lsm_id_def, 1)
+
+          with open(filepath, 'w') as f:
+              f.write(content)
+
+          print("Fixed lsm_hook.c: added struct lsm_id + 6.12 security_add_hooks guard")
+          PYEOF
+          fi
           cd "$WORKDIR"
 
           # --- 3. SUSFS (pinned commit on gki-android16-6.12) ---
