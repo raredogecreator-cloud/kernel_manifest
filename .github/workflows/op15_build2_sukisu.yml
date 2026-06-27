@@ -184,19 +184,99 @@ jobs:
             || { echo "FATAL: susfs.h not found"; exit 1; }
 
           # --- 3b. Apply SUSFS KernelSU integration patch ---
-          # Adds SUSFS Kconfig entries to KernelSU and removes lsm_hook.o from Kbuild
-          # (SUSFS uses kprobes, not LSM hooks — avoids 6.12 struct lsm_id issue)
+          # Adds SUSFS Kconfig, Kbuild changes (removes lsm_hook.o), susfs_init() wiring,
+          # SELinux SID helpers, sucompat changes. Designed for KSU main branch structure.
           echo "=== Applying 10_enable_susfs_for_ksu.patch to KernelSU ==="
           test -f susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch \
             || { echo "FATAL: 10_enable_susfs_for_ksu.patch not found"; exit 1; }
           cp susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch common/KernelSU/
           cd common/KernelSU
-          if ! patch -p1 < 10_enable_susfs_for_ksu.patch; then
-            echo "FATAL: KernelSU SUSFS integration patch failed"
-            find . -name "*.rej" -exec echo "--- {} ---" \; -exec cat {} \;
+
+          # 21/29 files are exact blob matches. 7/8 mismatches apply with fuzz=3.
+          # core/init.c will reject (SukiSU adds uts_spoof.h + spoof_release params).
+          # Apply with || true, then fix init.c rejects manually.
+          patch -p1 --fuzz=3 < 10_enable_susfs_for_ksu.patch || true
+
+          # Show what rejected
+          REJECTS=$(find . -name "*.rej" -print)
+          if [ -n "$REJECTS" ]; then
+            echo "=== Rejected files ==="
+            echo "$REJECTS"
+            for r in $REJECTS; do echo "--- $r ---"; cat "$r"; done
+          fi
+
+          # Fix core/init.c rejects manually — the patch expects tiann's init.c
+          # but SukiSU-Ultra 7cd3be6 has extra uts_spoof.h + spoof module_params.
+          INIT="kernel/core/init.c"
+          if [ -f "$INIT.rej" ]; then
+            echo "=== Fixing init.c rejects ==="
+
+            # 1. Add susfs.h include if not already added by patch
+            grep -q '#include <linux/susfs.h>' "$INIT" \
+              || sed -i '/#include <linux\/moduleparam.h>/a #include <linux/susfs.h>' "$INIT"
+
+            # 2. Remove old hook includes (keep uts_spoof.h)
+            sed -i '/#include "hook\/syscall_hook_manager.h"/d' "$INIT"
+            sed -i '/#include "hook\/lsm_hook.h"/d' "$INIT"
+            sed -i '/#include "hook\/syscall_hook.h"/d' "$INIT"
+            sed -i '/#include "infra\/symbol_resolver.h"/d' "$INIT"
+
+            # 3. Add new includes if not already present
+            grep -q '#include "hook/setuid_hook.h"' "$INIT" \
+              || sed -i '/#include "feature\/adb_root.h"/a #include "hook/setuid_hook.h"' "$INIT"
+            grep -q '#include "feature/sucompat.h"' "$INIT" \
+              || sed -i '/#include "hook\/setuid_hook.h"/a #include "feature/sucompat.h"' "$INIT"
+
+            # 4. Remove x86_64 indirect syscall block if still present
+            sed -i '/#if defined(__x86_64__)/,/#endif/{ /#if defined(__x86_64__)/d; /X86_FEATURE_INDIRECT_SAFE/d; /#error.*FATAL.*indirect/d; /#endif/d; /cpufeature/d; /linux\/version/d; /#ifndef/d }' "$INIT"
+
+            # 5. Remove old hook init calls
+            sed -i '/ksu_init_symbol_resolver();/d' "$INIT"
+            sed -i '/ksu_syscall_hook_init();/d' "$INIT"
+            sed -i '/ksu_lsm_hook_init();/d' "$INIT"
+
+            # 6. Add susfs_init() after ksu_feature_init() if not already present
+            grep -q 'susfs_init()' "$INIT" \
+              || sed -i '/ksu_feature_init();/a \\n#ifdef CONFIG_KSU_SUSFS\n\tsusfs_init();\n#endif' "$INIT"
+
+            # 7. Add sucompat/setuid hook inits if not already present
+            grep -q 'ksu_sucompat_init();' "$INIT" \
+              || sed -i '/ksu_supercalls_init();/a \    ksu_sucompat_init();' "$INIT"
+            grep -q 'ksu_setuid_hook_init();' "$INIT" \
+              || sed -i '/ksu_sucompat_init();/a \    ksu_setuid_hook_init();' "$INIT"
+
+            # 8. Remove old hook manager/lsm init+exit calls
+            sed -i '/ksu_syscall_hook_manager_init();/d' "$INIT"
+            sed -i '/ksu_syscall_hook_manager_exit();/d' "$INIT"
+            sed -i '/ksu_lsm_hook_exit();/d' "$INIT"
+
+            rm -f "$INIT.rej" "$INIT.orig"
+            echo "init.c rejects fixed"
+          fi
+
+          # Fail on any unhandled reject
+          REMAINING_REJECTS=$(find . -name "*.rej" -print)
+          if [ -n "$REMAINING_REJECTS" ]; then
+            echo "FATAL: unhandled patch rejects remain"
+            echo "$REMAINING_REJECTS"
+            for r in $REMAINING_REJECTS; do echo "--- $r ---"; cat "$r"; done
             exit 1
           fi
-          echo "KernelSU SUSFS integration patch applied"
+          find . -name "*.orig" -delete 2>/dev/null || true
+
+          # Verify full SUSFS/SukiSU integration
+          echo "=== Verify SUSFS integration ==="
+          grep -q "susfs_init();" "$INIT" || { echo "FATAL: susfs_init missing"; exit 1; }
+          grep -q "ksu_sucompat_init();" "$INIT" || { echo "FATAL: ksu_sucompat_init missing"; exit 1; }
+          grep -q "ksu_setuid_hook_init();" "$INIT" || { echo "FATAL: ksu_setuid_hook_init missing"; exit 1; }
+          grep -q "ksu_syscall_hook_manager_init();" "$INIT" && { echo "FATAL: old syscall hook manager init still present"; exit 1; }
+          grep -q "ksu_syscall_hook_manager_exit();" "$INIT" && { echo "FATAL: old syscall hook manager exit still present"; exit 1; }
+          grep -q "ksu_lsm_hook_init();" "$INIT" && { echo "FATAL: old lsm init still present"; exit 1; }
+          grep -q "ksu_lsm_hook_exit();" "$INIT" && { echo "FATAL: old lsm exit still present"; exit 1; }
+          grep -q "CONFIG_KSU_SUSFS" kernel/Kconfig || { echo "FATAL: SUSFS Kconfig missing"; exit 1; }
+          grep -q "lsm_hook.o" kernel/Kbuild && { echo "FATAL: lsm_hook.o still in Kbuild"; exit 1; }
+          echo "SUSFS integration verified"
+
           rm -f 10_enable_susfs_for_ksu.patch
           cd "$WORKDIR"
 
