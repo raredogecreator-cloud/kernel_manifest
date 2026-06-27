@@ -273,7 +273,7 @@ jobs:
           grep -q "ksu_syscall_hook_manager_exit();" "$INIT" && { echo "FATAL: old syscall hook manager exit still present"; exit 1; }
           grep -q "ksu_lsm_hook_init();" "$INIT" && { echo "FATAL: old lsm init still present"; exit 1; }
           grep -q "ksu_lsm_hook_exit();" "$INIT" && { echo "FATAL: old lsm exit still present"; exit 1; }
-          grep -q "CONFIG_KSU_SUSFS" kernel/Kconfig || { echo "FATAL: SUSFS Kconfig missing"; exit 1; }
+          grep -q "config KSU_SUSFS" kernel/Kconfig || { echo "FATAL: SUSFS Kconfig missing"; exit 1; }
           grep -q "lsm_hook.o" kernel/Kbuild && { echo "FATAL: lsm_hook.o still in Kbuild"; exit 1; }
           echo "SUSFS integration verified"
 
