@@ -159,18 +159,14 @@ jobs:
           echo "KSU commit count: $KSU_VERSION"
 
           # --- 2b. Fix: builtin branch includes lsm_hook.c unconditionally ---
-          # lsm_hook.c uses security_add_hooks("ksu") which is incompatible with
-          # 6.12's struct lsm_id API. SUSFS uses kprobes instead of LSM hooks,
-          # so lsm_hook.c should not be compiled when CONFIG_KSU_SUSFS=y.
-          # Wrap the include so it's skipped when SUSFS is active.
+          # lsm_hook.c uses security_add_hooks("ksu") which changed to struct lsm_id
+          # in 6.12. SUSFS uses kprobes, not LSM hooks. Guard both the include and
+          # the init call so lsm_hook.c is entirely excluded when SUSFS is active.
           KSU_C="KernelSU/kernel/ksu.c"
-          if grep -q '#include "hook/lsm_hook.c"' "$KSU_C"; then
-            sed -i 's|#include "hook/lsm_hook.c"|#ifndef CONFIG_KSU_SUSFS\n#include "hook/lsm_hook.c"\n#endif|' "$KSU_C"
-            echo "Fixed ksu.c: lsm_hook.c include guarded by CONFIG_KSU_SUSFS"
-            grep -n -A1 -B1 'lsm_hook' "$KSU_C"
-          else
-            echo "WARNING: lsm_hook.c include not found in ksu.c (may already be fixed)"
-          fi
+          sed -i 's|^#include "hook/lsm_hook.c"|#ifndef CONFIG_KSU_SUSFS\n#include "hook/lsm_hook.c"\n#endif|' "$KSU_C"
+          sed -i 's|^\s*ksu_lsm_hook_init();|#ifndef CONFIG_KSU_SUSFS\n\tksu_lsm_hook_init();\n#endif|' "$KSU_C"
+          echo "=== ksu.c lsm_hook references after fix ==="
+          grep -n 'lsm_hook\|CONFIG_KSU_SUSFS' "$KSU_C"
           cd "$WORKDIR"
 
           # --- 3. SUSFS (pinned commit on gki-android16-6.12) ---
