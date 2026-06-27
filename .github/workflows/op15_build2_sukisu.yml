@@ -130,20 +130,21 @@ jobs:
           set -euo pipefail
           cd "$WORKDIR"
 
-          # --- 1. Init git in common/ (setup.sh needs git for version detection) ---
-          cd common
-          git init -q
-          git -c user.email=ci@build -c user.name=CI commit -q --allow-empty -m "source"
-          cd "$WORKDIR"
-
-          # --- 2. SukiSU Ultra (pinned commit on builtin branch) ---
-          echo "=== Installing SukiSU Ultra (builtin @ $SUKISU_SHA) ==="
-          cd common
+          # --- 1. SukiSU Ultra (pinned commit) ---
+          # CRITICAL: run setup.sh from WORKDIR (parent of common/), NOT from inside
+          # common/. setup.sh detects common/drivers and places KernelSU as a SIBLING
+          # of common ($WORKDIR/KernelSU). This is the proven layout used by zh_build,
+          # bouteillepleine, etc. Running it from inside common/ puts KernelSU inside
+          # the compiled source tree and breaks the uapi symlink include resolution.
+          echo "=== Installing SukiSU Ultra @ $SUKISU_SHA (from WORKDIR) ==="
+          test -d common/drivers || { echo "FATAL: common/drivers missing"; exit 1; }
           curl --fail --retry 3 --retry-delay 5 -LSs \
             "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/$SUKISU_SHA/kernel/setup.sh" \
             | bash -s "$SUKISU_SHA"
 
-          test -d KernelSU || { echo "FATAL: KernelSU directory not created by setup.sh"; exit 1; }
+          test -d KernelSU || { echo "FATAL: KernelSU not created at WORKDIR"; exit 1; }
+          test -L common/drivers/kernelsu || { echo "FATAL: drivers/kernelsu symlink not created"; exit 1; }
+          echo "drivers/kernelsu -> $(readlink common/drivers/kernelsu)"
 
           # Verify pinned commit — fail hard if wrong
           ACTUAL_SHA=$(cd KernelSU && git rev-parse HEAD)
@@ -160,24 +161,6 @@ jobs:
 
           KSU_VERSION=$(cd KernelSU && git rev-list --count HEAD 2>/dev/null || echo "unknown")
           echo "KSU commit count: $KSU_VERSION"
-
-          # --- 2b. Dereference uapi symlink ---
-          # kernel/include/uapi is a symlink to ../../uapi (repo-root uapi dir).
-          # The kernel build reaches it via drivers/kernelsu (another symlink),
-          # and the double-symlink-with-relative-target fails include resolution
-          # ('uapi/app_profile.h' not found). Replace symlink with a real copy.
-          UAPI_LINK="KernelSU/kernel/include/uapi"
-          if [ -L "$UAPI_LINK" ]; then
-            UAPI_TARGET="$(cd KernelSU/kernel/include && readlink -f uapi)"
-            test -d "$UAPI_TARGET" || { echo "FATAL: uapi symlink target missing: $UAPI_TARGET"; exit 1; }
-            rm -f "$UAPI_LINK"
-            cp -rL "$UAPI_TARGET" "$UAPI_LINK"
-            test -f "$UAPI_LINK/app_profile.h" || { echo "FATAL: uapi copy missing app_profile.h"; ls -la "$UAPI_LINK"; exit 1; }
-            echo "Replaced uapi symlink with real copy ($(ls "$UAPI_LINK" | wc -l) files)"
-          else
-            echo "uapi is not a symlink (already a real dir or absent) — skipping"
-          fi
-          cd "$WORKDIR"
 
           # --- 3. SUSFS (pinned commit on gki-android16-6.12) ---
           echo "=== Cloning SUSFS @ $SUSFS_SHA ==="
@@ -206,8 +189,8 @@ jobs:
           echo "=== Applying 10_enable_susfs_for_ksu.patch to KernelSU ==="
           test -f susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch \
             || { echo "FATAL: 10_enable_susfs_for_ksu.patch not found"; exit 1; }
-          cp susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch common/KernelSU/
-          cd common/KernelSU
+          cp susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch KernelSU/
+          cd KernelSU
 
           # 21/29 files are exact blob matches. 7/8 mismatches apply with fuzz=3.
           # core/init.c will reject (SukiSU adds uts_spoof.h + spoof_release params).
