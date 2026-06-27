@@ -160,6 +160,23 @@ jobs:
 
           KSU_VERSION=$(cd KernelSU && git rev-list --count HEAD 2>/dev/null || echo "unknown")
           echo "KSU commit count: $KSU_VERSION"
+
+          # --- 2b. Dereference uapi symlink ---
+          # kernel/include/uapi is a symlink to ../../uapi (repo-root uapi dir).
+          # The kernel build reaches it via drivers/kernelsu (another symlink),
+          # and the double-symlink-with-relative-target fails include resolution
+          # ('uapi/app_profile.h' not found). Replace symlink with a real copy.
+          UAPI_LINK="KernelSU/kernel/include/uapi"
+          if [ -L "$UAPI_LINK" ]; then
+            UAPI_TARGET="$(cd KernelSU/kernel/include && readlink -f uapi)"
+            test -d "$UAPI_TARGET" || { echo "FATAL: uapi symlink target missing: $UAPI_TARGET"; exit 1; }
+            rm -f "$UAPI_LINK"
+            cp -rL "$UAPI_TARGET" "$UAPI_LINK"
+            test -f "$UAPI_LINK/app_profile.h" || { echo "FATAL: uapi copy missing app_profile.h"; ls -la "$UAPI_LINK"; exit 1; }
+            echo "Replaced uapi symlink with real copy ($(ls "$UAPI_LINK" | wc -l) files)"
+          else
+            echo "uapi is not a symlink (already a real dir or absent) — skipping"
+          fi
           cd "$WORKDIR"
 
           # --- 3. SUSFS (pinned commit on gki-android16-6.12) ---
