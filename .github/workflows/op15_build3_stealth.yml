@@ -1,0 +1,537 @@
+name: OnePlus 15 Build 3 - Stealth (SukiSU + SUSFS + kernel cloak)
+
+# Build 2: SukiSU Ultra (builtin) + SUSFS v2.2.0 on exact Build 1 base.
+# Same source, toolchain, build method as Build 1B.
+# No KPM, no BBG, no stealth patches, no performance tuning.
+# OP15-specific: bouteillepleine recovery bootloop fix for sus_mount.
+
+on:
+  workflow_dispatch:
+
+env:
+  SOURCE_REPO: OnePlusOSS/android_kernel_common_oneplus_sm8850
+  SOURCE_SHA: d9053b907db4bb5da938e9cf947d0ae32302ceaf
+  SOURCE_BRANCH: oneplus/sm8850_b_16.0.0_oneplus_15
+  TOOLCHAIN_BASE: https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang19-r536225
+  SUKISU_SHA: b88403d2561b6e00dff84a3c851e630c62f57fd0
+  SUSFS_SHA: 72bdce7ce2de8189efb227c6cefbc578a9efd479
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Disk cleanup
+        run: |
+          set -euo pipefail
+          df -h /
+          mkdir -p /tmp/.background_trash/{1..10}
+          safe_mv() { [ -e "$1" ] && sudo mv "$1" "$2" || true; }
+          export -f safe_mv
+          safe_mv /usr/share/dotnet /tmp/.background_trash/1 &
+          safe_mv /usr/local/lib/android /tmp/.background_trash/2 &
+          safe_mv /opt/ghc /tmp/.background_trash/3 &
+          safe_mv /opt/hostedtoolcache/CodeQL /tmp/.background_trash/4 &
+          safe_mv /usr/local/share/chromium /tmp/.background_trash/5 &
+          safe_mv /usr/local/share/powershell /tmp/.background_trash/6 &
+          safe_mv /opt/hostedtoolcache/go /tmp/.background_trash/7 &
+          safe_mv /opt/hostedtoolcache/PyPy /tmp/.background_trash/8 &
+          safe_mv /opt/hostedtoolcache/node /tmp/.background_trash/9 &
+          sudo bash -c 'mv /usr/local/julia* /tmp/.background_trash/10 2>/dev/null || true' &
+          wait
+          sudo nice -n 19 ionice -c 3 rm -rf /tmp/.background_trash &
+          disown
+          df -h /
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ca-certificates cpio curl flex git \
+            kmod libelf-dev libssl-dev lz4 python3 python-is-python3 \
+            zip zstd rsync ccache aria2 pigz pahole libdw-dev elfutils dwarves
+
+      - name: Download source and toolchains
+        run: |
+          set -euo pipefail
+          mkdir -p kernel_workspace
+          cd kernel_workspace
+          WORKDIR="$(pwd)"
+          echo "WORKDIR=$WORKDIR" >> "$GITHUB_ENV"
+
+          echo "=== Source: $SOURCE_REPO @ $SOURCE_SHA ==="
+
+          aria2c -x16 -s16 -k1M --retry-wait=5 --max-tries=10 \
+            --summary-interval=0 --header='User-Agent: Mozilla/5.0' \
+            -o source.tar.gz "https://github.com/${SOURCE_REPO}/archive/${SOURCE_SHA}.tar.gz" &
+          PID_SRC=$!
+
+          aria2c -x16 -s16 -k1M --retry-wait=5 --max-tries=5 \
+            --summary-interval=0 -o clang.zip "${TOOLCHAIN_BASE}/clang-r536225.zip" &
+          PID_CLG=$!
+
+          aria2c -x16 -s16 -k1M --retry-wait=5 --max-tries=5 \
+            --summary-interval=0 -o rust.zip "${TOOLCHAIN_BASE}/rust.zip" &
+          PID_RST=$!
+
+          aria2c -x16 -s16 -k1M --retry-wait=5 --max-tries=5 \
+            --summary-interval=0 -o build-tools.zip "${TOOLCHAIN_BASE}/build-tools.zip" &
+          PID_BT=$!
+
+          wait $PID_SRC || { echo "FATAL: source download failed"; exit 1; }
+          wait $PID_CLG || { echo "FATAL: clang download failed"; exit 1; }
+          wait $PID_RST || { echo "FATAL: rust download failed"; exit 1; }
+          wait $PID_BT  || { echo "FATAL: build-tools download failed"; exit 1; }
+          echo "All downloads complete"
+
+          echo "Extracting source..."
+          mkdir -p common
+          tar -I "pigz -p $(nproc)" -x -f source.tar.gz -C common --strip-components=1
+          rm source.tar.gz
+
+          echo "Extracting clang..."
+          mkdir -p clang19
+          unzip -q clang.zip -d clang19
+          rm clang.zip
+
+          echo "Extracting rust..."
+          mkdir -p rust
+          unzip -q rust.zip -d rust
+          rm rust.zip
+
+          echo "Extracting build-tools..."
+          unzip -q build-tools.zip
+          rm build-tools.zip
+
+          test -f common/arch/arm64/configs/gki_defconfig || { echo "FATAL: gki_defconfig missing"; exit 1; }
+          test -f common/Makefile || { echo "FATAL: kernel Makefile missing"; exit 1; }
+
+          export PATH="$WORKDIR/clang19/bin:$WORKDIR/build-tools/bin:$WORKDIR/rust/bin:$PATH"
+          echo "PATH=$WORKDIR/clang19/bin:$WORKDIR/build-tools/bin:$WORKDIR/rust/bin:$PATH" >> "$GITHUB_ENV"
+          echo "LIBCLANG_PATH=$WORKDIR/clang19/lib" >> "$GITHUB_ENV"
+
+          echo "=== Toolchain verification ==="
+          command -v clang   && clang --version | head -1   || { echo "FATAL: clang missing"; exit 1; }
+          command -v ld.lld                                 || { echo "FATAL: ld.lld missing"; exit 1; }
+          command -v rustc   && rustc --version             || { echo "FATAL: rustc missing"; exit 1; }
+          command -v bindgen && bindgen --version           || { echo "FATAL: bindgen missing"; exit 1; }
+          command -v pahole  && pahole --version            || echo "WARN: pahole from system"
+          test -d "$WORKDIR/clang19/lib"                    || { echo "FATAL: LIBCLANG_PATH missing"; exit 1; }
+
+          df -h /
+
+      - name: Integrate SukiSU Ultra + SUSFS
+        run: |
+          set -euo pipefail
+          cd "$WORKDIR"
+
+          # --- 1. SukiSU Ultra builtin (pinned) ---
+          # builtin branch has SUSFS Kconfig + correct includes (no uapi-split problem
+          # that main/7cd3be6 has). Run setup.sh from WORKDIR so KernelSU is a sibling
+          # of common (proven layout: numbersf, zh).
+          echo "=== Installing SukiSU Ultra @ $SUKISU_SHA (builtin, from WORKDIR) ==="
+          test -d common/drivers || { echo "FATAL: common/drivers missing"; exit 1; }
+          curl --fail --retry 3 --retry-delay 5 -LSs \
+            "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/$SUKISU_SHA/kernel/setup.sh" \
+            | bash -s "$SUKISU_SHA"
+
+          test -d KernelSU || { echo "FATAL: KernelSU not created at WORKDIR"; exit 1; }
+          test -L common/drivers/kernelsu || { echo "FATAL: drivers/kernelsu symlink not created"; exit 1; }
+          echo "drivers/kernelsu -> $(readlink common/drivers/kernelsu)"
+
+          # Verify pinned commit - fail hard if wrong
+          ACTUAL_SHA=$(cd KernelSU && git rev-parse HEAD)
+          echo "SukiSU Ultra installed @ $ACTUAL_SHA"
+          if [ "$ACTUAL_SHA" != "$SUKISU_SHA" ]; then
+            echo "setup.sh checked out $ACTUAL_SHA instead of pinned $SUKISU_SHA - forcing..."
+            (cd KernelSU && git fetch origin "$SUKISU_SHA" && git checkout "$SUKISU_SHA")
+            ACTUAL_SHA=$(cd KernelSU && git rev-parse HEAD)
+            if [ "$ACTUAL_SHA" != "$SUKISU_SHA" ]; then
+              echo "FATAL: SukiSU pin mismatch - expected $SUKISU_SHA got $ACTUAL_SHA"
+              exit 1
+            fi
+          fi
+
+          KSU_VERSION=$(cd KernelSU && git rev-list --count HEAD 2>/dev/null || echo "unknown")
+          echo "KSU commit count: $KSU_VERSION"
+
+          # --- 2. Fix lsm_hook.c for 6.12 (the ONLY builtin blocker) ---
+          # 6.12 changed security_add_hooks 3rd arg from const char* to const struct lsm_id*.
+          # Under CONFIG_KSU_SUSFS, ksu_hooks[] is empty (key_permission HISI-only,
+          # task_fix_setuid is #ifndef SUSFS), so skip the empty registration entirely.
+          # ksu_handle_setresuid() stays in the file (still compiled). Verified: this was
+          # the single compile error in the first builtin build; 50_add_susfs applied clean.
+          LSM="KernelSU/kernel/hook/lsm_hook.c"
+          test -f "$LSM" || { echo "FATAL: lsm_hook.c not found"; exit 1; }
+          python3 - "$LSM" << 'PYEOF'
+          import sys
+          f = sys.argv[1]
+          s = open(f).read()
+          old = '#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0)\n    security_add_hooks(ksu_hooks, ARRAY_SIZE(ksu_hooks), "ksu");\n#else\n    // https://elixir.bootlin.com/linux/v4.10.17/source/include/linux/lsm_hooks.h#L1892\n    security_add_hooks(ksu_hooks, ARRAY_SIZE(ksu_hooks));\n#endif'
+          new = '#ifndef CONFIG_KSU_SUSFS\n#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0)\n    security_add_hooks(ksu_hooks, ARRAY_SIZE(ksu_hooks), "ksu");\n#else\n    security_add_hooks(ksu_hooks, ARRAY_SIZE(ksu_hooks));\n#endif\n#endif'
+          n = s.count(old)
+          if n != 1:
+              print("FATAL: expected exactly 1 security_add_hooks block, found", n)
+              sys.exit(1)
+          open(f, 'w').write(s.replace(old, new, 1))
+          print("lsm_hook.c 6.12 SUSFS guard applied")
+          PYEOF
+          grep -q "^#ifndef CONFIG_KSU_SUSFS" "$LSM" || { echo "FATAL: lsm guard not applied"; exit 1; }
+          cd "$WORKDIR"
+
+          # --- 3. SUSFS (pinned commit on gki-android16-6.12) ---
+          echo "=== Cloning SUSFS @ $SUSFS_SHA ==="
+          git clone https://gitlab.com/simonpunk/susfs4ksu.git \
+            -b gki-android16-6.12 susfs4ksu
+          (cd susfs4ksu && git checkout "$SUSFS_SHA")
+
+          ACTUAL_SUSFS=$(cd susfs4ksu && git rev-parse HEAD)
+          echo "SUSFS commit: $ACTUAL_SUSFS"
+          if [ "$ACTUAL_SUSFS" != "$SUSFS_SHA" ]; then
+            echo "FATAL: SUSFS checkout mismatch: expected $SUSFS_SHA got $ACTUAL_SUSFS"
+            exit 1
+          fi
+
+          # Verify patch file exists before copying
+          test -f susfs4ksu/kernel_patches/50_add_susfs_in_gki-android16-6.12.patch \
+            || { echo "FATAL: SUSFS patch not found"; ls -la susfs4ksu/kernel_patches/; exit 1; }
+          test -f susfs4ksu/kernel_patches/fs/susfs.c \
+            || { echo "FATAL: susfs.c not found"; exit 1; }
+          test -f susfs4ksu/kernel_patches/include/linux/susfs.h \
+            || { echo "FATAL: susfs.h not found"; exit 1; }
+
+          # --- 3b. Apply SUSFS kernel-level patch (50_add_susfs) to common/ ONLY ---
+          # SukiSU Ultra has SUSFS built in - do NOT apply 10_enable (that's for tiann KSU).
+          # Verified clean against OnePlus 6.12 in first builtin build (all hunks succeeded).
+          cp susfs4ksu/kernel_patches/fs/susfs.c common/fs/
+          cp susfs4ksu/kernel_patches/include/linux/susfs.h common/include/linux/
+          cp susfs4ksu/kernel_patches/include/linux/susfs_def.h common/include/linux/
+          cp susfs4ksu/kernel_patches/50_add_susfs_in_gki-android16-6.12.patch common/
+
+          echo "=== Applying SUSFS kernel patch ==="
+          cd common
+          if ! patch -p1 < 50_add_susfs_in_gki-android16-6.12.patch; then
+            echo "FATAL: SUSFS kernel patch failed"
+            find . -name "*.rej" -exec echo "--- {} ---" \; -exec cat {} \;
+            exit 1
+          fi
+          echo "SUSFS kernel patch applied"
+          rm -f 50_add_susfs_in_gki-android16-6.12.patch
+          cd "$WORKDIR"
+
+          # --- 4. OP15 recovery bootloop fix (from bouteillepleine) ---
+          # Source: bouteillepleine OP15 workflow, fix_op15_recovery_bootloop_sus_mount()
+          # Adds null-pointer and self-parent guards to SUSFS mnt_parent traversal.
+          # Only applied if the exact unguarded pattern is found in SUSFS-patched source.
+          echo "=== OP15 recovery bootloop fix (conditional) ==="
+          cd common
+          python3 << 'PYEOF'
+          import os
+
+          def check_and_fix(filepath, old, new, description):
+              if not os.path.isfile(filepath):
+                  print(f"  SKIP {filepath}: file not present")
+                  return
+              with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                  content = f.read()
+              count = content.count(old)
+              if count == 0:
+                  print(f"  SKIP {filepath}: pattern not found (already fixed or not applicable)")
+                  return
+              if count > 1:
+                  print(f"  SKIP {filepath}: pattern found {count} times (ambiguous, refusing)")
+                  return
+              content = content.replace(old, new, 1)
+              with open(filepath, 'w', encoding='utf-8') as f:
+                  f.write(content)
+              print(f"  APPLIED {filepath}: {description}")
+
+          old_loop = 'for (; mnt->mnt_id >= DEFAULT_KSU_MNT_ID; mnt = mnt->mnt_parent) { }'
+          new_loop = 'for (; mnt->mnt_id >= DEFAULT_KSU_MNT_ID && mnt->mnt_parent && mnt != mnt->mnt_parent; mnt = mnt->mnt_parent) { }'
+
+          for f in ['./fs/statfs.c', './fs/proc/fd.c']:
+              check_and_fix(f, old_loop, new_loop, "mnt_parent traversal guard")
+
+          old_statfs = 'error = statfs_by_dentry(mnt->mnt.mnt_root, buf);'
+          new_statfs = 'if (likely(susfs_is_current_proc_umounted_app())) { error = statfs_by_dentry(mnt->mnt.mnt_root, buf); } else { error = statfs_by_dentry(path->dentry, buf); }'
+
+          check_and_fix('./fs/statfs.c', old_statfs, new_statfs, "statfs_by_dentry path fix")
+          PYEOF
+          cd "$WORKDIR"
+
+          # --- 5. Append KSU + SUSFS config to gki_defconfig ---
+          echo "=== Appending KSU/SUSFS config ==="
+          cd common
+          cat >> arch/arm64/configs/gki_defconfig << 'CONFIGEOF'
+
+          # SukiSU Ultra
+          CONFIG_KSU=y
+          CONFIG_KPM=n
+          # SUSFS
+          CONFIG_KSU_SUSFS=y
+          CONFIG_KSU_SUSFS_SUS_PATH=y
+          CONFIG_KSU_SUSFS_SUS_MOUNT=y
+          CONFIG_KSU_SUSFS_SUS_KSTAT=y
+          CONFIG_KSU_SUSFS_SUS_MAP=y
+          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+          CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
+          CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
+          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+          CONFIG_KSU_SUSFS_ENABLE_LOG=n
+          # Filesystem
+          CONFIG_TMPFS_XATTR=y
+          CONFIG_TMPFS_POSIX_ACL=y
+          CONFIGEOF
+          echo "Config appended to gki_defconfig"
+
+          echo "=== Verify defconfig tail ==="
+          tail -20 arch/arm64/configs/gki_defconfig
+          cd "$WORKDIR"
+
+          # --- 6. Summary ---
+          echo ""
+          echo "=== Integration summary ==="
+          echo "SukiSU Ultra: builtin branch"
+          echo "SUSFS: gki-android16-6.12 @ $SUSFS_SHA"
+          echo "KPM: disabled (CONFIG_KPM=n)"
+          echo "BBG: not installed"
+          echo "Stealth patches: 7 (VFS/kallsyms/IKCONFIG/DirtySepolicy/devpts/proc-net-unix/supercall)"
+          echo "Performance tuning: none"
+          df -h /
+
+      - name: Apply stealth patches (v1 OP15 6.12)
+        run: |
+          set -euo pipefail
+          cd "$WORKDIR"
+          echo '=== Stealth layer: 7 kernel cloak patches (verified vs post-SUSFS source) ==='
+
+          # --- 1. Supercall reboot-magic gate (KernelSU/ at WORKDIR) ---
+          echo "IyEvdXNyL2Jpbi9lbnYgcHl0aG9uMwoiIiIKU3VraVNVIHJlYm9vdC1tYWdpYyBmZCBpbnN0YWxsIGdhdGUgKFAyKQpUYXJnZXQ6IEtlcm5lbFNVKi9rZXJuZWwvc3VwZXJjYWxsL3N1cGVyY2FsbC5jIChwdWxsZWQgYnkgc2V0dXAuc2ggYXQgYnVpbGQgdGltZSkKCkJ1aWx0aW4gYnJhbmNoIHVzZXMga3N1X2hhbmRsZV9zeXNfcmVib290KCkgKG5vdCByZWJvb3RfaGFuZGxlcl9wcmUpLgpUaGlzIGlzIGEgZGlyZWN0IGhhbmRsZXIgKG5vdCBrcHJvYmUpLCBjYWxsZWQgZnJvbSBrc3UuYy4KUmV0dXJuIC1FSU5WQUwgPSAibm90IG91ciBtYWdpYyIgPSBzdG9jay1saWtlIGJlaGF2aW9yLgoKRmlsZSBpcyAjaW5jbHVkZWQgaW50byBrc3UuYyBhcyBvbmUgdHJhbnNsYXRpb24gdW5pdDoKICBrc3UuYyBpbmNsdWRlcyBwZXJtLmMg4oaSIGRpc3BhdGNoLmMg4oaSIHN1cGVyY2FsbC5jClNvIG1hbmFnZXJfb3Jfcm9vdCgpIGZyb20gcGVybS5jIGlzIGF2YWlsYWJsZSB3aXRob3V0IGV4dHJhIGluY2x1ZGVzLgoKU291cmNlIHZlcmlmaWVkIGFnYWluc3Q6CiAgU3VraVNVLVVsdHJhL1N1a2lTVS1VbHRyYS9rZXJuZWwvc3VwZXJjYWxsL3N1cGVyY2FsbC5jIEAgYnVpbHRpbgogIGtzdV9oYW5kbGVfc3lzX3JlYm9vdCBhdCBMMTAxLCBtYW5hZ2VyX29yX3Jvb3QgZnJvbSBwZXJtLmMgKHNhbWUgVFUpCiIiIgppbXBvcnQgc3lzCmltcG9ydCBvcwppbXBvcnQgZ2xvYgoKVEFCID0gY2hyKDkpCk5MID0gY2hyKDEwKQoKCmRlZiBmaW5kX3N1cGVyY2FsbF9maWxlKCk6CiAgICAiIiJGaW5kIHN1cGVyY2FsbC5jIGluIHRoZSBidWlsZCB0cmVlIOKAlCBzZXR1cC5zaCBwdXRzIGl0IHVuZGVyIEtlcm5lbFNVKi8iIiIKICAgIHBhdHRlcm5zID0gWwogICAgICAgICJLZXJuZWxTVSova2VybmVsL3N1cGVyY2FsbC9zdXBlcmNhbGwuYyIsCiAgICAgICAgIktlcm5lbFNVL2tlcm5lbC9zdXBlcmNhbGwvc3VwZXJjYWxsLmMiLAogICAgICAgICJLZXJuZWxTVS0qL2tlcm5lbC9zdXBlcmNhbGwvc3VwZXJjYWxsLmMiLAogICAgXQogICAgZm9yIHBhdCBpbiBwYXR0ZXJuczoKICAgICAgICBtYXRjaGVzID0gZ2xvYi5nbG9iKHBhdCkKICAgICAgICBpZiBtYXRjaGVzOgogICAgICAgICAgICByZXR1cm4gbWF0Y2hlc1swXQogICAgcHJpbnQoIkVSUk9SOiBzdXBlcmNhbGwuYyBub3QgZm91bmQuIFRyaWVkIHBhdHRlcm5zOiIpCiAgICBmb3IgcGF0IGluIHBhdHRlcm5zOgogICAgICAgIHByaW50KGYiICB7cGF0fSIpCiAgICBzeXMuZXhpdCgxKQoKCmRlZiBwYXRjaF9zdXBlcmNhbGwoKToKICAgIHBhdGggPSBmaW5kX3N1cGVyY2FsbF9maWxlKCkKICAgIHByaW50KGYiICBGb3VuZDoge3BhdGh9IikKCiAgICB3aXRoIG9wZW4ocGF0aCkgYXMgZjoKICAgICAgICBzID0gZi5yZWFkKCkKCiAgICBpZiAiU3VraVNVIHJlYm9vdC1tYWdpYyBnYXRlIiBpbiBzOgogICAgICAgIHByaW50KCJzdXBlcmNhbGwuYzogcmVib290LW1hZ2ljIGdhdGUgYWxyZWFkeSBhcHBsaWVkLiBTa2lwcGluZy4iKQogICAgICAgIHJldHVybgoKICAgICMgV2l0aCBDT05GSUdfS1NVX1NVU0ZTPXkgKG91ciBidWlsZCksIHRoZSBjb21waWxlZCBmdW5jdGlvbiBpczoKICAgICMgICBrc3Vfc3VwZXJjYWxsX3JlYm9vdF9oYW5kbGVyKHZvaWQgX191c2VyICoqYXJnKQogICAgIyBXaXRob3V0IFNVU0ZTLCBpdCB3b3VsZCBiZSBrc3VfaGFuZGxlX3N5c19yZWJvb3Qgb3IgcmVib290X2hhbmRsZXJfcHJlLgogICAgIyBXZSBoYW5kbGUgYWxsIHRocmVlIGZvciBzYWZldHkuCgogICAgcGF0Y2hlZCA9IEZhbHNlCgogICAgIyBQcmlvcml0eSAxOiBTVVNGUyBwYXRoICh3aGF0IG91ciBidWlsZCBhY3R1YWxseSB1c2VzKQogICAgaWYgImtzdV9zdXBlcmNhbGxfcmVib290X2hhbmRsZXIiIGluIHM6CiAgICAgICAgZnVuY19uYW1lID0gImtzdV9zdXBlcmNhbGxfcmVib290X2hhbmRsZXIiCiAgICAgICAgZnVuY19zdGFydCA9IHMuZmluZChmdW5jX25hbWUpCiAgICAgICAgIyBGaW5kIHRoZSBvcGVuaW5nIGJyYWNlIG9mIHRoZSBmdW5jdGlvbiBib2R5CiAgICAgICAgYnJhY2VfcG9zID0gcy5maW5kKCJ7IiwgZnVuY19zdGFydCkKICAgICAgICBhc3NlcnQgYnJhY2VfcG9zICE9IC0xLCBmIm9wZW5pbmcgYnJhY2Ugbm90IGZvdW5kIGFmdGVyIHtmdW5jX25hbWV9IgogICAgICAgIGluc2VydF9wb3MgPSBicmFjZV9wb3MgKyAxCgogICAgICAgICMgYjg4NDAzZDogc3VwZXJjYWxsLmMgaXMgI2luY2x1ZGVkIGludG8gYSBwYXJlbnQgVFU7IG1hbmFnZXJfb3Jfcm9vdCBpcwogICAgICAgICMgZGVjbGFyZWQgaW4gcG9saWN5L2FsbG93bGlzdC5oIHdoaWNoIG1heSBub3QgYmUgdmlzaWJsZSBoZXJlLiBGb3J3YXJkLWRlY2xhcmUKICAgICAgICAjIGV4dGVybiAoaGFybWxlc3MgaWYgYWxyZWFkeSBkZWNsYXJlZCwgbGlua3MgdG8gdGhlIHJlYWwgc3ltYm9sIGVpdGhlciB3YXkpIHNvCiAgICAgICAgIyB0aGlzIGNvbXBpbGVzIHVuZGVyIC1XZXJyb3IgcmVnYXJkbGVzcyBvZiB0aGUgcGFyZW50IFRVJ3MgaW5jbHVkZXMuCiAgICAgICAgZ2F0ZSA9ICgKICAgICAgICAgICAgTkwgKwogICAgICAgICAgICBUQUIgKyAiLyogU3VraVNVIHJlYm9vdC1tYWdpYyBnYXRlOiB1bmF1dGhvcml6ZWQgYXBwIG11c3Qgbm90IHJlYWNoIGZkIGluc3RhbGwgKi8iICsgTkwgKwogICAgICAgICAgICBUQUIgKyAieyBleHRlcm4gYm9vbCBtYW5hZ2VyX29yX3Jvb3Qodm9pZCk7IiArIE5MICsKICAgICAgICAgICAgVEFCICsgVEFCICsgImlmICghbWFuYWdlcl9vcl9yb290KCkpIiArIE5MICsKICAgICAgICAgICAgVEFCICsgVEFCICsgVEFCICsgInJldHVybiAwOyAvKiBuby1vcDogc3RvY2stbGlrZSwgbm8gc2lkZSBlZmZlY3QgKi8gfSIgKyBOTAogICAgICAgICkKICAgICAgICBzID0gc1s6aW5zZXJ0X3Bvc10gKyBnYXRlICsgc1tpbnNlcnRfcG9zOl0KICAgICAgICBwcmludChmInN1cGVyY2FsbC5jOiB7ZnVuY19uYW1lfSBnYXRlZCAoU1VTRlMgcGF0aCwgZXh0ZXJuLWRlY2xhcmVkIG1hbmFnZXJfb3Jfcm9vdCkiKQogICAgICAgIHBhdGNoZWQgPSBUcnVlCgogICAgIyBQcmlvcml0eSAyOiBub24tU1VTRlMgYnVpbHRpbiBwYXRoCiAgICBpZiAia3N1X2hhbmRsZV9zeXNfcmVib290IiBpbiBzIGFuZCBub3QgcGF0Y2hlZDoKICAgICAgICBhbmNob3IgPSBUQUIgKyAiaWYgKG1hZ2ljMSAhPSBLU1VfSU5TVEFMTF9NQUdJQzEpIgogICAgICAgIGZ1bmNfc3RhcnQgPSBzLmZpbmQoImtzdV9oYW5kbGVfc3lzX3JlYm9vdCIpCiAgICAgICAgYW5jaG9yX3BvcyA9IHMuZmluZChhbmNob3IsIGZ1bmNfc3RhcnQpCiAgICAgICAgaWYgYW5jaG9yX3BvcyAhPSAtMToKICAgICAgICAgICAgZ2F0ZSA9ICgKICAgICAgICAgICAgICAgIFRBQiArICIvKiBTdWtpU1UgcmVib290LW1hZ2ljIGdhdGU6IHVuYXV0aG9yaXplZCBhcHAgbXVzdCBub3QgcmVhY2ggbWFnaWMgY29tcGFyaXNvbiAqLyIgKyBOTCArCiAgICAgICAgICAgICAgICBUQUIgKyAiaWYgKCFtYW5hZ2VyX29yX3Jvb3QoKSkiICsgTkwgKwogICAgICAgICAgICAgICAgVEFCICsgVEFCICsgInJldHVybiAtRUlOVkFMOyIgKyBOTCArIE5MCiAgICAgICAgICAgICkKICAgICAgICAgICAgcyA9IHNbOmFuY2hvcl9wb3NdICsgZ2F0ZSArIHNbYW5jaG9yX3BvczpdCiAgICAgICAgICAgIHByaW50KCJzdXBlcmNhbGwuYzoga3N1X2hhbmRsZV9zeXNfcmVib290IGdhdGVkIChub24tU1VTRlMgcGF0aCkiKQogICAgICAgICAgICBwYXRjaGVkID0gVHJ1ZQoKICAgICMgUHJpb3JpdHkgMzogbWFpbiBicmFuY2gga3Byb2JlIHBhdGgKICAgIGlmICJyZWJvb3RfaGFuZGxlcl9wcmUiIGluIHMgYW5kIG5vdCBwYXRjaGVkOgogICAgICAgIGFuY2hvciA9IFRBQiArICJzdHJ1Y3QgcHRfcmVncyAqcmVhbF9yZWdzID0gUFRfUkVBTF9SRUdTKHJlZ3MpOyIKICAgICAgICBmdW5jX3N0YXJ0ID0gcy5maW5kKCJyZWJvb3RfaGFuZGxlcl9wcmUiKQogICAgICAgIGFuY2hvcl9wb3MgPSBzLmZpbmQoYW5jaG9yLCBmdW5jX3N0YXJ0KQogICAgICAgIGlmIGFuY2hvcl9wb3MgIT0gLTE6CiAgICAgICAgICAgIGdhdGUgPSAoCiAgICAgICAgICAgICAgICBUQUIgKyAiLyogU3VraVNVIHJlYm9vdC1tYWdpYyBnYXRlOiB1bmF1dGhvcml6ZWQgYXBwIG11c3Qgbm90IHJlYWNoIG1hZ2ljIGNvbXBhcmlzb24gKi8iICsgTkwgKwogICAgICAgICAgICAgICAgVEFCICsgImlmICghbWFuYWdlcl9vcl9yb290KCkpIiArIE5MICsKICAgICAgICAgICAgICAgIFRBQiArIFRBQiArICJyZXR1cm4gMDsiICsgTkwgKyBOTAogICAgICAgICAgICApCiAgICAgICAgICAgIHMgPSBzWzphbmNob3JfcG9zXSArIGdhdGUgKyBzW2FuY2hvcl9wb3M6XQogICAgICAgICAgICBwcmludCgic3VwZXJjYWxsLmM6IHJlYm9vdF9oYW5kbGVyX3ByZSBnYXRlZCAobWFpbiBicmFuY2ggcGF0aCkiKQogICAgICAgICAgICBwYXRjaGVkID0gVHJ1ZQoKICAgIGlmIG5vdCBwYXRjaGVkOgogICAgICAgIHByaW50KCJFUlJPUjogbm8gcmVib290IGhhbmRsZXIgZnVuY3Rpb24gZm91bmQgKHRyaWVkIGtzdV9zdXBlcmNhbGxfcmVib290X2hhbmRsZXIsIGtzdV9oYW5kbGVfc3lzX3JlYm9vdCwgcmVib290X2hhbmRsZXJfcHJlKSIpCiAgICAgICAgc3lzLmV4aXQoMSkKCiAgICB3aXRoIG9wZW4ocGF0aCwgInciKSBhcyBmOgogICAgICAgIGYud3JpdGUocykKCgppZiBfX25hbWVfXyA9PSAiX19tYWluX18iOgogICAgcGF0Y2hfc3VwZXJjYWxsKCkK" | base64 -d > /tmp/p_supercall.py
+          python3 /tmp/p_supercall.py
+          grep -q "reboot-magic gate" KernelSU/kernel/supercall/supercall.c || { echo "FATAL: supercall gate not applied"; exit 1; }
+
+          cd "$WORKDIR/common"
+
+          # --- 2. setlocalversion + metadata: /proc/version byte-matches stock .300 ---
+          STOCK_SUFFIX="-android16-5-gb2a876903b49-ab14541642-4k"
+          printf '#!/bin/sh\necho "%s"\n' "$STOCK_SUFFIX" > scripts/setlocalversion
+          chmod +x scripts/setlocalversion
+          echo "setlocalversion -> $(sh scripts/setlocalversion)"
+          # suffix now carries -4k; drop base CONFIG_LOCALVERSION and pin no-auto
+          sed -i '/^CONFIG_LOCALVERSION=/d' arch/arm64/configs/gki_defconfig
+          printf 'CONFIG_LOCALVERSION=""\nCONFIG_LOCALVERSION_AUTO=n\n' >> arch/arm64/configs/gki_defconfig
+
+          # --- 3. VFS cloak (filename_lookup + do_sys_openat2) ---
+          echo "IyEvdXNyL2Jpbi9lbnYgcHl0aG9uMwoiIiIKT1AxNSA2LjEyIFZGUyBzdGVhbHRoIHBhdGNoOiAvZGF0YS9hZGIgKyBBTEwgZGVzY2VuZGFudHMgcmV0dXJuIC1FTk9FTlQgZm9yIFVJRCA+PSAxMDAwMC4KCjYuMTIgUkVXUklURSB2cyBQYWNtYW4gNS4xNToKLSA1LjE1IGhvb2tlZCB1c2VyX3BhdGhfYXRfZW1wdHkoKS4gVGhhdCBmdW5jdGlvbiBpcyBHT05FIGluIDYuMTIgKGdldG5hbWVfZmxhZ3MgbG9zdAogIGl0cyAzcmQgYGVtcHR5YCBhcmcpLiBUaGUgc3RhdCBmYW1pbHkgKHN0YXQvc3RhdHgvbmV3ZnN0YXRhdCkgbm93IGNhbGxzIGZpbGVuYW1lX2xvb2t1cCgpCiAgRElSRUNUTFkgdmlhIHZmc19zdGF0eCgpLCBieXBhc3NpbmcgdXNlcl9wYXRoX2F0IGVudGlyZWx5LgotIFRoZSB0cnVlIHVuaXZlcnNhbCBjaG9rZXBvaW50IGluIDYuMTIgaXMgZmlsZW5hbWVfbG9va3VwKCkg4oCUIEJPVEggdXNlcl9wYXRoX2F0IChhY2Nlc3MvCiAgY2htb2QvY2hvd24vcmVhZGxpbmspIEFORCB2ZnNfc3RhdHggKHN0YXQvc3RhdHgvbmV3ZnN0YXRhdCkgZnVubmVsIHRocm91Z2ggaXQuCi0gb3Blbi9vcGVuYXQgdXNlIGRvX2ZpbHBfb3BlbiAobm90IGZpbGVuYW1lX2xvb2t1cCksIHNvIGRvX3N5c19vcGVuYXQyKCkgaXMgaG9va2VkCiAgc2VwYXJhdGVseSDigJQgdGhhdCBhbmNob3IgaXMgaWRlbnRpY2FsIHRvIDUuMTUgKHZlcmlmaWVkKS4KClZlcmlmaWVkIGFnYWluc3Q6CiAgT25lUGx1c09TUy9hbmRyb2lkX2tlcm5lbF9jb21tb25fb25lcGx1c19zbTg4NTAgQCBvbmVwbHVzL3NtODg1MF9iXzE2LjAuMF9vbmVwbHVzXzE1CiAgZmlsZW5hbWVfbG9va3VwIEAgbmFtZWkuYzoyNjAxLCBkb19zeXNfb3BlbmF0MiBAIG9wZW4uYzoxNDIyCiAgZ2V0bmFtZV9mbGFncyhuYW1lLCBmbGFncykgaXMgMi1hcmcgaW4gNi4xMi4KIiIiCmltcG9ydCBzeXMKCiMgUHVyZSBzdHJpbmcgbG9naWMg4oCUIHVuY2hhbmdlZCBmcm9tIFBhY21hbiB2MTEgKG5vIGtlcm5lbCBBUEkgZGVwZW5kZW5jeSkuCkhFTFBFUl9GVU5DID0gcicnJwovKiBTdWtpU1UgVkZTIENsb2FrOiByZXR1cm4gLUVOT0VOVCBmb3Igcm9vdC1yZWxhdGVkIHBhdGhzIChVSUQgPj0gMTAwMDApICovCnN0YXRpYyBib29sIHN1c2ZzX2lzX3N0ZWFsdGhfcGF0aChjb25zdCBjaGFyICppbikgewogICAgY2hhciBjbGVhblsxMjhdOwogICAgY2hhciBidWZbMTI4XTsKICAgIGNoYXIgKnNlZ21lbnRzWzE2XTsKICAgIGludCBzZWdfY291bnQgPSAwOwogICAgY2hhciAqcCA9IGJ1ZjsKICAgIGNoYXIgKnRva2VuOwogICAgaW50IGksIG91dF9pZHg7CiAgICBib29sIGlzX3JlbGF0aXZlID0gZmFsc2U7CgogICAgaWYgKCFpbiB8fCBpblswXSA9PSAnXDAnKQogICAgICAgIHJldHVybiBmYWxzZTsKCiAgICAvKiBEZXRlY3QgcmVsYXRpdmUgdnMgYWJzb2x1dGUgKi8KICAgIGlmIChpblswXSAhPSAnLycpIHsKICAgICAgICAvKiBSZWxhdGl2ZSBwYXRoOiBvbmx5IGVudGVyIGlmIHN0YXJ0cyB3aXRoICJhZGIiIHNlZ21lbnQgKi8KICAgICAgICBpZiAoc3RybmNtcChpbiwgImFkYi8iLCA0KSAhPSAwICYmIHN0cmNtcChpbiwgImFkYiIpICE9IDApCiAgICAgICAgICAgIHJldHVybiBmYWxzZTsKICAgICAgICBpc19yZWxhdGl2ZSA9IHRydWU7CiAgICB9IGVsc2UgewogICAgICAgIC8qIEFic29sdXRlIHBhdGg6IGZhc3QtcmVqZWN0IHVzaW5nIC9kYXRhL2FkYiBwcmVmaXggKi8KICAgICAgICBpZiAoc3RybmNtcChpbiwgIi9kYXRhL2FkYiIsIDkpICE9IDApCiAgICAgICAgICAgIHJldHVybiBmYWxzZTsKICAgICAgICAvKiBNdXN0IGJlIGV4YWN0bHkgL2RhdGEvYWRiIG9yIC9kYXRhL2FkYi8gb3IgL2RhdGEvYWRiLy4uLiAqLwogICAgICAgIGlmIChpbls5XSAhPSAnXDAnICYmIGluWzldICE9ICcvJykKICAgICAgICAgICAgcmV0dXJuIGZhbHNlOwogICAgfQoKICAgIC8qIEJvdW5kZWQgY29weTogZmFpbCBDTE9TRUQgZm9yIC9kYXRhL2FkYiBwYXRocyBleGNlZWRpbmcgYnVmZmVyICovCiAgICBpZiAoc3Ryc2NweShidWYsIGluLCBzaXplb2YoYnVmKSkgPCAwKQogICAgICAgIHJldHVybiBpc19yZWxhdGl2ZSB8fCBzdHJuY21wKGluLCAiL2RhdGEvYWRiIiwgOSkgPT0gMDsKCiAgICAvKiBDYW5vbmljYWxpemU6IGNvbGxhcHNlIC8vLCAvLi8sIC8uLi8gKi8KICAgIHdoaWxlICgodG9rZW4gPSBzdHJzZXAoJnAsICIvIikpICE9IE5VTEwpIHsKICAgICAgICBpZiAoKnRva2VuID09ICdcMCcgfHwgc3RyY21wKHRva2VuLCAiLiIpID09IDApCiAgICAgICAgICAgIGNvbnRpbnVlOwogICAgICAgIGlmIChzdHJjbXAodG9rZW4sICIuLiIpID09IDApIHsKICAgICAgICAgICAgaWYgKHNlZ19jb3VudCA+IDApIHNlZ19jb3VudC0tOwogICAgICAgICAgICBjb250aW51ZTsKICAgICAgICB9CiAgICAgICAgaWYgKHNlZ19jb3VudCA8IDE2KQogICAgICAgICAgICBzZWdtZW50c1tzZWdfY291bnQrK10gPSB0b2tlbjsKICAgICAgICBlbHNlCiAgICAgICAgICAgIHJldHVybiB0cnVlOyAvKiB0b28gbWFueSBzZWdtZW50cyBvbiBhIC9kYXRhL2FkYiBwYXRoID0gZmFpbCBjbG9zZWQgKi8KICAgIH0KCiAgICAvKiBSZWNvbnN0cnVjdCBjbGVhbiBwYXRoICovCiAgICBvdXRfaWR4ID0gMDsKICAgIGlmICghaXNfcmVsYXRpdmUpCiAgICAgICAgY2xlYW5bb3V0X2lkeCsrXSA9ICcvJzsKICAgIGZvciAoaSA9IDA7IGkgPCBzZWdfY291bnQ7IGkrKykgewogICAgICAgIGludCBsZW4gPSBzdHJsZW4oc2VnbWVudHNbaV0pOwogICAgICAgIGlmIChvdXRfaWR4ICsgbGVuICsgMSA+PSAoaW50KXNpemVvZihjbGVhbikpCiAgICAgICAgICAgIHJldHVybiB0cnVlOyAvKiBvdmVyZmxvdyBvbiAvZGF0YS9hZGIgcGF0aCA9IGZhaWwgY2xvc2VkICovCiAgICAgICAgbWVtY3B5KGNsZWFuICsgb3V0X2lkeCwgc2VnbWVudHNbaV0sIGxlbik7CiAgICAgICAgb3V0X2lkeCArPSBsZW47CiAgICAgICAgaWYgKGkgPCBzZWdfY291bnQgLSAxKQogICAgICAgICAgICBjbGVhbltvdXRfaWR4KytdID0gJy8nOwogICAgfQogICAgY2xlYW5bb3V0X2lkeF0gPSAnXDAnOwoKICAgIGlmIChpc19yZWxhdGl2ZSkgewogICAgICAgIGlmIChzdHJjbXAoY2xlYW4sICJhZGIiKSA9PSAwKQogICAgICAgICAgICByZXR1cm4gdHJ1ZTsKICAgICAgICBpZiAoc3RybmNtcChjbGVhbiwgImFkYi8iLCA0KSA9PSAwICYmIGNsZWFuWzRdICE9ICdcMCcpCiAgICAgICAgICAgIHJldHVybiB0cnVlOwogICAgICAgIHJldHVybiBmYWxzZTsKICAgIH0KCiAgICBpZiAoc3RyY21wKGNsZWFuLCAiL2RhdGEvYWRiIikgPT0gMCB8fCBzdHJjbXAoY2xlYW4sICIvZGF0YS9hZGIvIikgPT0gMCkKICAgICAgICByZXR1cm4gdHJ1ZTsKICAgIGlmIChzdHJuY21wKGNsZWFuLCAiL2RhdGEvYWRiLyIsIDEwKSA9PSAwICYmIGNsZWFuWzEwXSAhPSAnXDAnKQogICAgICAgIHJldHVybiB0cnVlOwoKICAgIHJldHVybiBmYWxzZTsKfQonJycKCgpkZWYgcGF0Y2hfbmFtZWkoKToKICAgIHdpdGggb3BlbigiZnMvbmFtZWkuYyIpIGFzIGY6CiAgICAgICAgcyA9IGYucmVhZCgpCgogICAgIyBBZGQgY3JlZC5oICsgc3RyaW5nLmggYWZ0ZXIgdWFjY2Vzcy5oIChjb25maXJtZWQgcHJlc2VudCBAIEw0MikuCiAgICBpZiAibGludXgvY3JlZC5oIiBub3QgaW4gczoKICAgICAgICBhbmNob3IgPSAiI2luY2x1ZGUgPGxpbnV4L3VhY2Nlc3MuaD4iCiAgICAgICAgYXNzZXJ0IGFuY2hvciBpbiBzLCAidWFjY2Vzcy5oIGluY2x1ZGUgYW5jaG9yIG5vdCBmb3VuZCBpbiBuYW1laS5jIgogICAgICAgIHMgPSBzLnJlcGxhY2UoYW5jaG9yLAogICAgICAgICAgICAgICAgICAgICAgYW5jaG9yICsgIlxuI2luY2x1ZGUgPGxpbnV4L2NyZWQuaD5cbiNpbmNsdWRlIDxsaW51eC9zdHJpbmcuaD4iLCAxKQogICAgYXNzZXJ0ICJsaW51eC9jcmVkLmgiIGluIHMsICJGYWlsZWQgdG8gYWRkIGNyZWQuaCB0byBuYW1laS5jIgoKICAgICMgSW5zZXJ0IGhlbHBlciBiZWZvcmUgZmlsZW5hbWVfbG9va3VwICh0aGUgNi4xMiB1bml2ZXJzYWwgY2hva2Vwb2ludCkuCiAgICBzaWcgPSAiaW50IGZpbGVuYW1lX2xvb2t1cChpbnQgZGZkLCBzdHJ1Y3QgZmlsZW5hbWUgKm5hbWUsIHVuc2lnbmVkIGZsYWdzLCIKICAgIGFzc2VydCBzaWcgaW4gcywgImZpbGVuYW1lX2xvb2t1cCBzaWduYXR1cmUgbm90IGZvdW5kIgogICAgaWYgInN1c2ZzX2lzX3N0ZWFsdGhfcGF0aCIgbm90IGluIHM6CiAgICAgICAgcyA9IHMucmVwbGFjZShzaWcsIEhFTFBFUl9GVU5DICsgIlxuIiArIHNpZywgMSkKCiAgICAjIEhvb2s6IHJpZ2h0IGFmdGVyIHRoZSBJU19FUlIobmFtZSkgZ3VhcmQuIGZpbGVuYW1lX2xvb2t1cCBkb2VzIE5PVCBvd24gYG5hbWVgCiAgICAjIChjYWxsZXIgcHV0bmFtZXMgaXQpLCBzbyB3ZSBtdXN0IE5PVCBwdXRuYW1lIGhlcmUg4oCUIGp1c3QgcmV0dXJuIC1FTk9FTlQuCiAgICBvbGQgPSAoIlx0aW50IHJldHZhbDtcbiIKICAgICAgICAgICAiXHRzdHJ1Y3QgbmFtZWlkYXRhIG5kO1xuIgogICAgICAgICAgICJcdGlmIChJU19FUlIobmFtZSkpXG4iCiAgICAgICAgICAgIlx0XHRyZXR1cm4gUFRSX0VSUihuYW1lKTtcbiIKICAgICAgICAgICAiXHRzZXRfbmFtZWlkYXRhKCZuZCwgZGZkLCBuYW1lLCByb290KTsiKQogICAgbmV3ID0gKCJcdGludCByZXR2YWw7XG4iCiAgICAgICAgICAgIlx0c3RydWN0IG5hbWVpZGF0YSBuZDtcbiIKICAgICAgICAgICAiXHRpZiAoSVNfRVJSKG5hbWUpKVxuIgogICAgICAgICAgICJcdFx0cmV0dXJuIFBUUl9FUlIobmFtZSk7XG4iCiAgICAgICAgICAgIlxuIgogICAgICAgICAgICJcdC8qIFN1a2lTVSBDbG9hazogRU5PRU5UIGZvciByb290IHBhdGhzIGZyb20gYXBwcyAodW5pdmVyc2FsIGxvb2t1cCBjaG9rZXBvaW50KSAqL1xuIgogICAgICAgICAgICJcdGlmIChjdXJyZW50X3VpZCgpLnZhbCA+PSAxMDAwMCAmJiBuYW1lLT5uYW1lICYmXG4iCiAgICAgICAgICAgIlx0ICAgIHN1c2ZzX2lzX3N0ZWFsdGhfcGF0aChuYW1lLT5uYW1lKSlcbiIKICAgICAgICAgICAiXHRcdHJldHVybiAtRU5PRU5UO1xuIgogICAgICAgICAgICJcbiIKICAgICAgICAgICAiXHRzZXRfbmFtZWlkYXRhKCZuZCwgZGZkLCBuYW1lLCByb290KTsiKQogICAgYXNzZXJ0IG9sZCBpbiBzLCAiZmlsZW5hbWVfbG9va3VwIGJvZHkgYW5jaG9yIG5vdCBmb3VuZCAoc291cmNlIG1heSBoYXZlIGNoYW5nZWQpIgogICAgcyA9IHMucmVwbGFjZShvbGQsIG5ldywgMSkKCiAgICB3aXRoIG9wZW4oImZzL25hbWVpLmMiLCAidyIpIGFzIGY6CiAgICAgICAgZi53cml0ZShzKQogICAgcHJpbnQoIm5hbWVpLmM6IGZpbGVuYW1lX2xvb2t1cCBob29rZWQgKDYuMTIgdW5pdmVyc2FsIGNob2tlcG9pbnQ6IHN0YXQvc3RhdHgvYWNjZXNzL2NobW9kL2Nob3duL3JlYWRsaW5rKSIpCgoKZGVmIHBhdGNoX29wZW4oKToKICAgIHdpdGggb3BlbigiZnMvb3Blbi5jIikgYXMgZjoKICAgICAgICBzID0gZi5yZWFkKCkKCiAgICBpZiAibGludXgvY3JlZC5oIiBub3QgaW4gczoKICAgICAgICBhbmNob3IgPSAiI2luY2x1ZGUgPGxpbnV4L3N0cmluZy5oPiIKICAgICAgICBpZiBhbmNob3IgaW4gczoKICAgICAgICAgICAgcyA9IHMucmVwbGFjZShhbmNob3IsIGFuY2hvciArICJcbiNpbmNsdWRlIDxsaW51eC9jcmVkLmg+IiwgMSkKICAgICAgICBlbHNlOgogICAgICAgICAgICBzID0gcy5yZXBsYWNlKCIjaW5jbHVkZSA8bGludXgvZnMuaD4iLAogICAgICAgICAgICAgICAgICAgICAgICAgICIjaW5jbHVkZSA8bGludXgvZnMuaD5cbiNpbmNsdWRlIDxsaW51eC9jcmVkLmg+XG4jaW5jbHVkZSA8bGludXgvc3RyaW5nLmg+IiwgMSkKICAgIGFzc2VydCAibGludXgvY3JlZC5oIiBpbiBzLCAiRmFpbGVkIHRvIGFkZCBjcmVkLmggdG8gb3Blbi5jIgoKICAgIGlmICJzdXNmc19pc19zdGVhbHRoX3BhdGgiIG5vdCBpbiBzOgogICAgICAgIHMgPSBzLnJlcGxhY2UoInN0YXRpYyBsb25nIGRvX3N5c19vcGVuYXQyKGludCBkZmQsIiwKICAgICAgICAgICAgICAgICAgICAgIEhFTFBFUl9GVU5DICsgIlxuc3RhdGljIGxvbmcgZG9fc3lzX29wZW5hdDIoaW50IGRmZCwiLCAxKQoKICAgICMgZG9fc3lzX29wZW5hdDIgYW5jaG9yIOKAlCBpZGVudGljYWwgdG8gNS4xNSAodmVyaWZpZWQgdmVyYmF0aW0gaW4gNi4xMikuCiAgICBvbGQgPSAoIlx0dG1wID0gZ2V0bmFtZShmaWxlbmFtZSk7XG4iCiAgICAgICAgICAgIlx0aWYgKElTX0VSUih0bXApKVxuIgogICAgICAgICAgICJcdFx0cmV0dXJuIFBUUl9FUlIodG1wKTtcbiIKICAgICAgICAgICAiXG4iCiAgICAgICAgICAgIlx0ZmQgPSBnZXRfdW51c2VkX2ZkX2ZsYWdzKGhvdy0+ZmxhZ3MpOyIpCiAgICBuZXcgPSAoIlx0dG1wID0gZ2V0bmFtZShmaWxlbmFtZSk7XG4iCiAgICAgICAgICAgIlx0aWYgKElTX0VSUih0bXApKVxuIgogICAgICAgICAgICJcdFx0cmV0dXJuIFBUUl9FUlIodG1wKTtcbiIKICAgICAgICAgICAiXG4iCiAgICAgICAgICAgIlx0LyogU3VraVNVIENsb2FrOiBFTk9FTlQgZm9yIHJvb3QgcGF0aHMgZnJvbSBhcHBzIChvcGVuL29wZW5hdCkgKi9cbiIKICAgICAgICAgICAiXHRpZiAoY3VycmVudF91aWQoKS52YWwgPj0gMTAwMDAgJiYgdG1wLT5uYW1lKSB7XG4iCiAgICAgICAgICAgIlx0XHRpZiAoc3VzZnNfaXNfc3RlYWx0aF9wYXRoKHRtcC0+bmFtZSkpIHtcbiIKICAgICAgICAgICAiXHRcdFx0cHV0bmFtZSh0bXApO1xuIgogICAgICAgICAgICJcdFx0XHRyZXR1cm4gLUVOT0VOVDtcbiIKICAgICAgICAgICAiXHRcdH1cbiIKICAgICAgICAgICAiXHR9XG4iCiAgICAgICAgICAgIlxuIgogICAgICAgICAgICJcdGZkID0gZ2V0X3VudXNlZF9mZF9mbGFncyhob3ctPmZsYWdzKTsiKQogICAgYXNzZXJ0IG9sZCBpbiBzLCAiZG9fc3lzX29wZW5hdDIgYW5jaG9yIG5vdCBmb3VuZCAoc291cmNlIG1heSBoYXZlIGNoYW5nZWQpIgogICAgcyA9IHMucmVwbGFjZShvbGQsIG5ldywgMSkKCiAgICB3aXRoIG9wZW4oImZzL29wZW4uYyIsICJ3IikgYXMgZjoKICAgICAgICBmLndyaXRlKHMpCiAgICBwcmludCgib3Blbi5jOiBkb19zeXNfb3BlbmF0MiBob29rZWQgKG9wZW4vb3BlbmF0KSIpCgoKaWYgX19uYW1lX18gPT0gIl9fbWFpbl9fIjoKICAgIHBhdGNoX25hbWVpKCkKICAgIHBhdGNoX29wZW4oKQogICAgIyBWZXJpZnkgYm90aCBmaWxlcyBjYXJyeSB0aGUgaGVscGVyICsgaG9vawogICAgbiA9IG9wZW4oImZzL25hbWVpLmMiKS5yZWFkKCkKICAgIG8gPSBvcGVuKCJmcy9vcGVuLmMiKS5yZWFkKCkKICAgIGFzc2VydCBuLmNvdW50KCJzdXNmc19pc19zdGVhbHRoX3BhdGgiKSA+PSAyLCAibmFtZWkuYyBob29rIG1pc3NpbmciCiAgICBhc3NlcnQgby5jb3VudCgic3VzZnNfaXNfc3RlYWx0aF9wYXRoIikgPj0gMiwgIm9wZW4uYyBob29rIG1pc3NpbmciCiAgICBhc3NlcnQgImN1cnJlbnRfdWlkKCkudmFsID49IDEwMDAwIiBpbiBuIGFuZCAiY3VycmVudF91aWQoKS52YWwgPj0gMTAwMDAiIGluIG8KICAgIHByaW50KCJWRlMgc3RlYWx0aCBwYXRjaCAoT1AxNSA2LjEyKSBjb21wbGV0ZTogZmlsZW5hbWVfbG9va3VwICsgZG9fc3lzX29wZW5hdDIiKQo=" | base64 -d > /tmp/p_vfs.py
+          python3 /tmp/p_vfs.py
+
+          # --- 4. kallsyms filter ---
+          echo "IyEvdXNyL2Jpbi9lbnYgcHl0aG9uMwoiIiIKT1AxNSA2LjEyIGthbGxzeW1zIGZpbHRlcjogaGlkZSBrc3VfL3N1c2ZzXy9fa3BtIHN5bWJvbHMgZnJvbSAvcHJvYy9rYWxsc3ltcyBmb3IgYXBwcy4KCkNBUlJJRVMgZnJvbSBQYWNtYW4gKGFuY2hvcnMgY29uZmlybWVkIGlkZW50aWNhbCBpbiA2LjEyKToKICBrZXJuZWwva2FsbHN5bXMuYzogc19zaG93IEAgTDcyOCwgYW5jaG9yIGBpZiAoIWl0ZXItPm5hbWVbMF0pXG5cdFx0cmV0dXJuIDA7YCBAIEw3MzQsCiAgY3JlZC5oIGFuY2hvciBgI2luY2x1ZGUgPGxpbnV4L2tlcm5lbC5oPmAgQCBMMzEuCgpEZXZpY2UtdmVyaWZpZWQgKE9QMTUgcm9vdCk6IGtzdV8vc3VzZnNfL19rcG0gbWF0Y2ggZXhhY3RseSA3IGZyYW1ld29yayBzeW1ib2xzLCBaRVJPClF1YWxjb21tL3ZlbmRvciBmYWxzZS1wb3NpdGl2ZXMuIGBfa3BtYCBpcyBrZXB0IChjYXRjaGVzIGRvX2VuYWJsZV9rcG0pIGFuZCBpcyBoYXJtbGVzcwpldmVuIHdpdGggS1BNIGRpc2FibGVkLgoiIiIKaW1wb3J0IHN5cwoKd2l0aCBvcGVuKCJrZXJuZWwva2FsbHN5bXMuYyIpIGFzIGY6CiAgICBzID0gZi5yZWFkKCkKCiMgY3JlZC5oIGFmdGVyIGtlcm5lbC5oCmlmICJsaW51eC9jcmVkLmgiIG5vdCBpbiBzOgogICAgYW5jaG9yID0gIiNpbmNsdWRlIDxsaW51eC9rZXJuZWwuaD4iCiAgICBhc3NlcnQgYW5jaG9yIGluIHMsICJrZXJuZWwuaCBpbmNsdWRlIGFuY2hvciBub3QgZm91bmQgaW4ga2FsbHN5bXMuYyIKICAgIHMgPSBzLnJlcGxhY2UoYW5jaG9yLCBhbmNob3IgKyAiXG4jaW5jbHVkZSA8bGludXgvY3JlZC5oPiIsIDEpCmFzc2VydCAibGludXgvY3JlZC5oIiBpbiBzLCAiRmFpbGVkIHRvIGFkZCBjcmVkLmggdG8ga2FsbHN5bXMuYyIKCiMgSG9vayBpbiBzX3Nob3csIHJpZ2h0IGFmdGVyIHRoZSBlbXB0eS1uYW1lIGd1YXJkLgpvbGQgPSAiXHRpZiAoIWl0ZXItPm5hbWVbMF0pXG5cdFx0cmV0dXJuIDA7Igphc3NlcnQgb2xkIGluIHMsICJzX3Nob3cgZW1wdHktbmFtZSBhbmNob3Igbm90IGZvdW5kIgpuZXcgPSAob2xkICsgIlxuXG4iCiAgICAgICAiXHQvKiBIaWRlIEtTVS9TVVNGUy9LUE0gc3ltYm9scyBmcm9tIGFwcHMgKi9cbiIKICAgICAgICJcdGlmIChjdXJyZW50X3VpZCgpLnZhbCA+PSAxMDAwMCkge1xuIgogICAgICAgIlx0XHRpZiAoc3Ryc3RyKGl0ZXItPm5hbWUsIFwia3N1X1wiKSB8fFxuIgogICAgICAgIlx0XHQgICAgc3Ryc3RyKGl0ZXItPm5hbWUsIFwic3VzZnNfXCIpIHx8XG4iCiAgICAgICAiXHRcdCAgICBzdHJzdHIoaXRlci0+bmFtZSwgXCJfa3BtXCIpKVxuIgogICAgICAgIlx0XHRcdHJldHVybiAwO1xuIgogICAgICAgIlx0fSIpCmFzc2VydCBzLmNvdW50KG9sZCkgPT0gMSwgZiJleHBlY3RlZCAxIHNfc2hvdyBhbmNob3IsIGZvdW5kIHtzLmNvdW50KG9sZCl9IgpzID0gcy5yZXBsYWNlKG9sZCwgbmV3LCAxKQoKd2l0aCBvcGVuKCJrZXJuZWwva2FsbHN5bXMuYyIsICJ3IikgYXMgZjoKICAgIGYud3JpdGUocykKCiMgVmVyaWZ5CnAgPSBvcGVuKCJrZXJuZWwva2FsbHN5bXMuYyIpLnJlYWQoKQphc3NlcnQgIkhpZGUgS1NVL1NVU0ZTL0tQTSBzeW1ib2xzIiBpbiBwCmFzc2VydCAnc3Ryc3RyKGl0ZXItPm5hbWUsICJrc3VfIiknIGluIHAKYXNzZXJ0ICJjdXJyZW50X3VpZCgpLnZhbCA+PSAxMDAwMCIgaW4gcApwcmludCgia2FsbHN5bXMuYzoga3N1Xy9zdXNmc18vX2twbSBmaWx0ZXIgKE9QMTUgNi4xMikgY29tcGxldGUiKQo=" | base64 -d > /tmp/p_kallsyms.py
+          python3 /tmp/p_kallsyms.py
+
+          # --- 5. IKCONFIG sanitize ---
+          echo "IyEvdXNyL2Jpbi9lbnYgcHl0aG9uMwoiIiIKdjYgSUtDT05GSUcgc2FuaXRpemF0aW9uOiBtYWtlIC9wcm9jL2NvbmZpZy5neiBlbWJlZCBhIHNhbml0aXplZCAuY29uZmlnCndpdGhvdXQgQ09ORklHX0tTVS9TVVNGUy9LUE0gbGluZXMuIFJlYWwgLmNvbmZpZyBzdGlsbCB1c2VkIGZvciBjb21waWxhdGlvbi4KUGF0Y2hlcyBrZXJuZWwvTWFrZWZpbGUgdG8gZmlsdGVyIHRoZSBjb25maWdfZGF0YSBzb3VyY2UuCiIiIgoKd2l0aCBvcGVuKCJrZXJuZWwvTWFrZWZpbGUiKSBhcyBmOgogICAgcyA9IGYucmVhZCgpCgojIE9yaWdpbmFsIHJ1bGU6CiMgICAkKG9iaikvY29uZmlnX2RhdGE6ICQoS0NPTkZJR19DT05GSUcpIEZPUkNFCiMgICAJJChjYWxsIGZpbGVjaGssY2F0KQojCiMgUmVwbGFjZSB3aXRoOgojICAgJChvYmopL2NvbmZpZ19kYXRhOiAkKEtDT05GSUdfQ09ORklHKSBGT1JDRQojICAgCSQoY2FsbCBmaWxlY2hrLHN0ZWFsdGhfY29uZmlnKQojCiMgQW5kIGFkZCBhIGZpbGVjaGsgZGVmaW5pdGlvbiB0aGF0IGNhdHMgLmNvbmZpZyBidXQgc3RyaXBzIEtTVS9TVVNGUy9LUE0gbGluZXMKCm9sZF9ydWxlID0gIiQob2JqKS9jb25maWdfZGF0YTogJChLQ09ORklHX0NPTkZJRykgRk9SQ0Vcblx0JChjYWxsIGZpbGVjaGssY2F0KSIKCiMgTmV3IGZpbGVjaGsgdGhhdCBzdHJpcHMgcm9vdCBmcmFtZXdvcmsgbGluZXMKbmV3X2Jsb2NrID0gIiIiIyBTdWtpU1Ugc3RlYWx0aDogc2FuaXRpemUgSUtDT05GSUcgcGF5bG9hZApkZWZpbmUgZmlsZWNoa19zdGVhbHRoX2NvbmZpZwpjYXQgJDwgfCBncmVwIC12IENPTkZJR19LU1UgfCBncmVwIC12IENPTkZJR19LUE0gfCBncmVwIC12IFNVU0ZTIHwgZ3JlcCAtdiBLZXJuZWxTVSB8IGdyZXAgLXYgU3VraVNVCmVuZGVmCgokKG9iaikvY29uZmlnX2RhdGE6ICQoS0NPTkZJR19DT05GSUcpIEZPUkNFClx0JChjYWxsIGZpbGVjaGssc3RlYWx0aF9jb25maWcpIiIiCgppZiBvbGRfcnVsZSBpbiBzOgogICAgcyA9IHMucmVwbGFjZShvbGRfcnVsZSwgbmV3X2Jsb2NrLCAxKQogICAgcHJpbnQoImtlcm5lbC9NYWtlZmlsZTogSUtDT05GSUcgc2FuaXRpemF0aW9uIHBhdGNoZWQgT0siKQplbHNlOgogICAgIyBUcnkgd2l0aCBkaWZmZXJlbnQgd2hpdGVzcGFjZQogICAgaW1wb3J0IHJlCiAgICBwYXR0ZXJuID0gcidcJFwob2JqXCkvY29uZmlnX2RhdGE6XHMqXCRcKEtDT05GSUdfQ09ORklHXClccypGT1JDRVxzKlxuXHRcJFwoY2FsbCBmaWxlY2hrLGNhdFwpJwogICAgaWYgcmUuc2VhcmNoKHBhdHRlcm4sIHMpOgogICAgICAgIHMgPSByZS5zdWIocGF0dGVybiwgbmV3X2Jsb2NrLCBzLCBjb3VudD0xKQogICAgICAgIHByaW50KCJrZXJuZWwvTWFrZWZpbGU6IElLQ09ORklHIHNhbml0aXphdGlvbiBwYXRjaGVkIE9LIChyZWdleCkiKQogICAgZWxzZToKICAgICAgICBwcmludCgia2VybmVsL01ha2VmaWxlOiBXQVJOSU5HIC0gY291bGQgbm90IGZpbmQgY29uZmlnX2RhdGEgcnVsZSIpCiAgICAgICAgcHJpbnQoIkxvb2tpbmcgZm9yIGNvbmZpZ19kYXRhIGxpbmVzOiIpCiAgICAgICAgZm9yIGksIGxpbmUgaW4gZW51bWVyYXRlKHMuc3BsaXQoJ1xuJykpOgogICAgICAgICAgICBpZiAnY29uZmlnX2RhdGEnIGluIGxpbmU6CiAgICAgICAgICAgICAgICBwcmludChmIiAgTHtpKzF9OiB7bGluZX0iKQogICAgICAgIGltcG9ydCBzeXMKICAgICAgICBzeXMuZXhpdCgxKQoKd2l0aCBvcGVuKCJrZXJuZWwvTWFrZWZpbGUiLCAidyIpIGFzIGY6CiAgICBmLndyaXRlKHMpCg==" | base64 -d > /tmp/p_ikconfig.py
+          python3 /tmp/p_ikconfig.py
+
+          # --- 6. DirtySepolicy cloak ---
+          echo "IyEvdXNyL2Jpbi9lbnYgcHl0aG9uMwoiIiIKU3VraVNVIERpcnR5U2Vwb2xpY3kgQ2xvYWsgdjExClRhcmdldDogc2VjdXJpdHkvc2VsaW51eC9zZWxpbnV4ZnMuYyAoNS4xNSBHS0ksIE5vdGhpbmdPU1MgbXQ2ODg2KQoKSW5jbHVkZXMgYWxsIHYxMCBwYXRjaGVzIFBMVVM6Ci0gUDEtQTogR2F0ZSAvc3lzL2ZzL3NlbGludXgvcG9saWN5IHJlYWRzIGZvciBVSUQgPj0gMTAwMDAKICBBcHBzIGNhbiBkdW1wIHJhdyBiaW5hcnkgcG9saWN5IGFuZCBwYXJzZSBpdCBmb3Igcm9vdCB0eXBlIGRlZmluaXRpb25zLAogIGNvbXBsZXRlbHkgYnlwYXNzaW5nIHYxMCdzIHRyYW5zYWN0aW9uIGhhbmRsZXIgYmxvY2tzLgogIEdhdGUgYXQgc2VsX29wZW5fcG9saWN5KCkg4oCUIHJldHVybnMgLUVBQ0NFUyBmb3IgYXBwIFVJRHMuCgpTb3VyY2UgdmVyaWZpZWQgYWdhaW5zdDoKICByYXJlZG9nZWNyZWF0b3ItY2xvdWQvYW5kcm9pZF9rZXJuZWxfNS4xNV9ub3RoaW5nX210Njg4NiBAIG10Njg4Ni9QYWNtYW4vMTZiCiAgc2VsX29wZW5fcG9saWN5IGF0IEwzOTUsIHNlbF9yZWFkX3BvbGljeSBhdCBMNDYyLCBzZWxfcG9saWN5X29wcyBhdCBMNTIwCiIiIgppbXBvcnQgc3lzCmltcG9ydCByZQoKQkxPQ0tFRF9UWVBFUyA9IFsKICAgICI6c3U6IiwgIjprc3U6IiwgIjprc3VfZmlsZToiLCAiOnN1X2V4ZWM6IiwKICAgICI6bWFnaXNrOiIsICI6bWFnaXNrX2ZpbGU6IiwKICAgICI6enlnaXNrX2ZpbGU6IiwgIjpsc3Bvc2VkX2ZpbGU6IiwKICAgICI6c3VwZXJzdToiLCAiOnN1cGVyc3VfZmlsZToiLAogICAgIjpyaXJ1OiIsICI6ZWR4cG9zZWQ6IiwgIjpzaGFtaWtvOiIsCiAgICAiOmtlcm5lbHBhdGNoOiIsICI6a3BtOiIsCl0KClRBQiA9IGNocig5KQpOTCA9IGNocigxMCkKCkhFTFBFUl9GVU5DID0gIiIiLyogU3VraVNVIERpcnR5U2Vwb2xpY3kgQ2xvYWsgdjExOiBibG9jayByb290IFNFTGludXggdHlwZSBwcm9iZXMgZnJvbSBhcHBzICovCnN0YXRpYyBib29sIGlzX3Jvb3Rfc2VsaW51eF9wcm9iZShjb25zdCBjaGFyICpkYXRhLCBzaXplX3Qgc2l6ZSkgewolc3N0YXRpYyBjb25zdCBjaGFyICogY29uc3QgYmxvY2tlZFtdID0gewolcyVzTlVMTAolc307CiVzY29uc3QgY2hhciAqIGNvbnN0ICpwOwolc2lmICghZGF0YSB8fCBzaXplID09IDApCiVzJXNyZXR1cm4gZmFsc2U7CiVzZm9yIChwID0gYmxvY2tlZDsgKnA7IHArKykgewolcyVzaWYgKHN0cm5zdHIoZGF0YSwgKnAsIHNpemUpKQolcyVzJXNyZXR1cm4gdHJ1ZTsKJXN9CiVzcmV0dXJuIGZhbHNlOwp9CiIiIiAlICgKICAgIFRBQiwKICAgICIiLmpvaW4oVEFCICsgVEFCICsgJyIlcyIsJyAlIHQgKyBOTCBmb3IgdCBpbiBCTE9DS0VEX1RZUEVTKSwKICAgIFRBQiArIFRBQiwKICAgIFRBQiwKICAgIFRBQiwKICAgIFRBQiwKICAgIFRBQiwgVEFCLAogICAgVEFCLAogICAgVEFCLCBUQUIsCiAgICBUQUIsIFRBQiwgVEFCLAogICAgVEFCLAogICAgVEFCLAopCgoKZGVmIHBhdGNoX3NlbGludXhmcygpOgogICAgcGF0aCA9ICJzZWN1cml0eS9zZWxpbnV4L3NlbGludXhmcy5jIgogICAgd2l0aCBvcGVuKHBhdGgpIGFzIGY6CiAgICAgICAgcyA9IGYucmVhZCgpCgogICAgaWYgIkRpcnR5U2Vwb2xpY3kgQ2xvYWsgdjExIiBpbiBzOgogICAgICAgIHByaW50KCJzZWxpbnV4ZnMuYzogdjExIGFscmVhZHkgYXBwbGllZC4gU2tpcHBpbmcuIikKICAgICAgICByZXR1cm4KCiAgICAjIDEuIEFkZCAjaW5jbHVkZSA8bGludXgvY3JlZC5oPgogICAgaWYgImxpbnV4L2NyZWQuaCIgbm90IGluIHM6CiAgICAgICAgcyA9IHMucmVwbGFjZSgiI2luY2x1ZGUgPGxpbnV4L3N0cmluZy5oPiIsCiAgICAgICAgICAgICAgICAgICAgICAgIiNpbmNsdWRlIDxsaW51eC9zdHJpbmcuaD5cbiNpbmNsdWRlIDxsaW51eC9jcmVkLmg+IikKICAgICAgICBpZiAibGludXgvY3JlZC5oIiBub3QgaW4gczoKICAgICAgICAgICAgcyA9IHJlLnN1YihyJygjaW5jbHVkZVxzKzxbXj5dKz5cbiknLCByJ1wxI2luY2x1ZGUgPGxpbnV4L2NyZWQuaD5cbicsIHMsIGNvdW50PTEpCiAgICBhc3NlcnQgImxpbnV4L2NyZWQuaCIgaW4gcywgIkZhaWxlZCB0byBhZGQgY3JlZC5oIgogICAgcHJpbnQoIiAgY3JlZC5oOiBPSyIpCgogICAgIyAyLiBJbnNlcnQgaGVscGVyIEJFRk9SRSBzZWxfd3JpdGVfdmFsaWRhdGV0cmFucyAoZmlyc3QgY29uc3VtZXIsIEw3NzgpCiAgICB2dF9zaWcgPSAic3RhdGljIHNzaXplX3Qgc2VsX3dyaXRlX3ZhbGlkYXRldHJhbnMoc3RydWN0IGZpbGUgKmZpbGUsIgogICAgYXNzZXJ0IHZ0X3NpZyBpbiBzLCAic2VsX3dyaXRlX3ZhbGlkYXRldHJhbnMgbm90IGZvdW5kIgogICAgcyA9IHMucmVwbGFjZSh2dF9zaWcsIEhFTFBFUl9GVU5DICsgTkwgKyB2dF9zaWcsIDEpCiAgICBwcmludCgiICBoZWxwZXIgZnVuY3Rpb246IGluc2VydGVkIGJlZm9yZSBzZWxfd3JpdGVfdmFsaWRhdGV0cmFucyIpCgogICAgIyAzLiBIb29rIHNlbF93cml0ZV92YWxpZGF0ZXRyYW5zIOKAlCBhZnRlciBtZW1kdXBfdXNlcl9udWwvSVNfRVJSLCBiZWZvcmUgc3NjYW5mCiAgICB2dF9hbmNob3IgPSBUQUIgKyAicmMgPSAtRUlOVkFMOyIgKyBOTCArIFRBQiArICJpZiAoc3NjYW5mKHJlcSwiCiAgICBhc3NlcnQgdnRfYW5jaG9yIGluIHMsICJ2YWxpZGF0ZXRyYW5zIHNzY2FuZiBhbmNob3Igbm90IGZvdW5kIgogICAgdnRfaG9vayA9ICgKICAgICAgICBUQUIgKyAiLyogU3VraVNVIERpcnR5U2Vwb2xpY3kgQ2xvYWsgdjExOiBibG9jayByb290IHR5cGUgcHJvYmVzICovIiArIE5MICsKICAgICAgICBUQUIgKyAiaWYgKGN1cnJlbnRfdWlkKCkudmFsID49IDEwMDAwICYmIGlzX3Jvb3Rfc2VsaW51eF9wcm9iZShyZXEsIGNvdW50KSkgeyIgKyBOTCArCiAgICAgICAgVEFCICsgVEFCICsgInJjID0gLUVJTlZBTDsiICsgTkwgKwogICAgICAgIFRBQiArIFRBQiArICJnb3RvIG91dDsiICsgTkwgKwogICAgICAgIFRBQiArICJ9IiArIE5MICsgTkwKICAgICkKICAgIHMgPSBzLnJlcGxhY2UodnRfYW5jaG9yLCB2dF9ob29rICsgdnRfYW5jaG9yLCAxKQogICAgcHJpbnQoIiAgc2VsX3dyaXRlX3ZhbGlkYXRldHJhbnM6IGhvb2tlZCAocmVxLCBjb3VudCwgcmMpIikKCiAgICAjIDQuIEhvb2sgc2VsaW51eF90cmFuc2FjdGlvbl93cml0ZSDigJQgYmVmb3JlIHdyaXRlX29wW2lub10gZGlzcGF0Y2gKICAgIHR3X2FuY2hvciA9IFRBQiArICJydiA9IHdyaXRlX29wW2lub10oZmlsZSwgZGF0YSwgc2l6ZSk7IgogICAgYXNzZXJ0IHR3X2FuY2hvciBpbiBzLCAid3JpdGVfb3AgZGlzcGF0Y2ggbm90IGZvdW5kIgogICAgdHdfaG9vayA9ICgKICAgICAgICBUQUIgKyAiLyogU3VraVNVIERpcnR5U2Vwb2xpY3kgQ2xvYWsgdjExOiBibG9jayByb290IHR5cGUgcHJvYmVzIGZyb20gYXBwcyAqLyIgKyBOTCArCiAgICAgICAgVEFCICsgImlmIChjdXJyZW50X3VpZCgpLnZhbCA+PSAxMDAwMCAmJiBpc19yb290X3NlbGludXhfcHJvYmUoZGF0YSwgc2l6ZSkpIHsiICsgTkwgKwogICAgICAgIFRBQiArIFRBQiArICJyZXR1cm4gLUVJTlZBTDsiICsgTkwgKwogICAgICAgIFRBQiArICJ9IiArIE5MICsgTkwKICAgICkKICAgIHMgPSBzLnJlcGxhY2UodHdfYW5jaG9yLCB0d19ob29rICsgdHdfYW5jaG9yLCAxKQogICAgcHJpbnQoIiAgc2VsaW51eF90cmFuc2FjdGlvbl93cml0ZTogaG9va2VkIChkYXRhLCBzaXplKSIpCgogICAgIyA1LiBQMS1BOiBHYXRlIHNlbF9vcGVuX3BvbGljeSDigJQgYmxvY2sgcmF3IHBvbGljeSByZWFkcyBmb3IgVUlEID49IDEwMDAwCiAgICAjICAgIHNlbF9vcGVuX3BvbGljeSBhdCBMMzk1IGNoZWNrcyBTRUNVUklUWV9fUkVBRF9QT0xJQ1kgdmlhIEFWQyBmaXJzdCwKICAgICMgICAgdGhlbiBwcm9jZWVkcy4gV2UgYWRkIFVJRCBnYXRlIGFmdGVyIHRoZSBBVkMgY2hlY2sgc3VjY2VlZHMuCiAgICAjICAgIEFuY2hvcjogInJjID0gLUVCVVNZOyIgKHRoZSBsaW5lIGFmdGVyIEFWQyBjaGVjayBwYXNzZXMpCiAgICAjICAgIFdlIGluc2VydCBCRUZPUkUgaXQgc28gdGhlIEFWQyBjaGVjayBzdGlsbCBydW5zIChzdG9jayBiZWhhdmlvciBmb3Igcm9vdCksCiAgICAjICAgIGJ1dCBhcHAgVUlEcyBnZXQgLUVBQ0NFUyBiZWZvcmUgcmVhY2hpbmcgcG9saWN5IGRhdGEuCiAgICBwb2xpY3lfYW5jaG9yID0gKAogICAgICAgIFRBQiArICJyYyA9IC1FQlVTWTsiICsgTkwgKwogICAgICAgIFRBQiArICJpZiAoZnNpLT5wb2xpY3lfb3BlbmVkKSIKICAgICkKICAgIGFzc2VydCBwb2xpY3lfYW5jaG9yIGluIHMsICJzZWxfb3Blbl9wb2xpY3kgRUJVU1kgYW5jaG9yIG5vdCBmb3VuZCIKICAgIHBvbGljeV9nYXRlID0gKAogICAgICAgIFRBQiArICIvKiBTdWtpU1UgRGlydHlTZXBvbGljeSBDbG9hayB2MTE6IGJsb2NrIHJhdyBwb2xpY3kgcmVhZHMgZnJvbSBhcHBzICovIiArIE5MICsKICAgICAgICBUQUIgKyAiaWYgKGN1cnJlbnRfdWlkKCkudmFsID49IDEwMDAwKSB7IiArIE5MICsKICAgICAgICBUQUIgKyBUQUIgKyAicmMgPSAtRUFDQ0VTOyIgKyBOTCArCiAgICAgICAgVEFCICsgVEFCICsgImdvdG8gZXJyOyIgKyBOTCArCiAgICAgICAgVEFCICsgIn0iICsgTkwgKyBOTAogICAgKQogICAgcyA9IHMucmVwbGFjZShwb2xpY3lfYW5jaG9yLCBwb2xpY3lfZ2F0ZSArIHBvbGljeV9hbmNob3IsIDEpCiAgICBwcmludCgiICBzZWxfb3Blbl9wb2xpY3k6IGdhdGVkIChVSUQgPj0gMTAwMDAgLT4gRUFDQ0VTKSIpCgogICAgIyA2LiBWZXJpZnkKICAgIGFzc2VydCBzLmNvdW50KCJEaXJ0eVNlcG9saWN5IENsb2FrIHYxMSIpID09IDQsIGYiRXhwZWN0ZWQgNCB2MTEgbWFya2VycywgZ290IHtzLmNvdW50KCdEaXJ0eVNlcG9saWN5IENsb2FrIHYxMScpfSIKICAgIHByb2JlX2NvdW50ID0gcy5jb3VudCgiaXNfcm9vdF9zZWxpbnV4X3Byb2JlIikKICAgIGFzc2VydCBwcm9iZV9jb3VudCA+PSAzLCBmIkV4cGVjdGVkIGhlbHBlciBkZWYgKyAyIGNhbGwgc2l0ZXMsIGdvdCB7cHJvYmVfY291bnR9IgoKICAgIHdpdGggb3BlbihwYXRoLCAidyIpIGFzIGY6CiAgICAgICAgZi53cml0ZShzKQoKICAgIHByaW50KCJzZWxpbnV4ZnMuYzogRGlydHlTZXBvbGljeSBDbG9hayB2MTEgY29tcGxldGUiKQogICAgcHJpbnQoZiIgIEJsb2NrZWQgdHlwZXM6IHtsZW4oQkxPQ0tFRF9UWVBFUyl9IikKICAgIHByaW50KCIgIEhvb2tzOiBzZWxpbnV4X3RyYW5zYWN0aW9uX3dyaXRlICg2IGhhbmRsZXJzKSArIHNlbF93cml0ZV92YWxpZGF0ZXRyYW5zICsgc2VsX29wZW5fcG9saWN5IikKICAgIHByaW50KCIgIEdhdGU6IFVJRCA+PSAxMDAwMCBvbmx5IikKCgppZiBfX25hbWVfXyA9PSAiX19tYWluX18iOgogICAgcGF0Y2hfc2VsaW51eGZzKCkK" | base64 -d > /tmp/p_dirtysepolicy.py
+          python3 /tmp/p_dirtysepolicy.py
+
+          # --- 7. devpts readdir filter (bool filldir) ---
+          echo "IyEvdXNyL2Jpbi9lbnYgcHl0aG9uMwoiIiIKT1AxNSA2LjEyIGRldnB0cyByZWFkZGlyIGZpbHRlcjogaGlkZSByb290LW93bmVkIChVSUQgMCkgUFRZcyBmcm9tIGFwcCBnZXRkZW50cy4KCjYuMTIgUkVXUklURSB2cyBQYWNtYW4gNS4xNToKLSBmaWxsZGlyX3Qgbm93IHJldHVybnMgYGJvb2xgIChpbmNsdWRlL2xpbnV4L2ZzLmg6MjAxNyksIHdoZXJlIFRSVUUgPSBjb250aW51ZSwKICBGQUxTRSA9IHN0b3AuIFBhY21hbidzIDUuMTUgYWN0b3IgcmV0dXJuZWQgYGludGAgd2l0aCBgcmV0dXJuIDBgIHRvIGhpZGUg4oCUIGNvcHlpbmcKICB0aGF0IHZlcmJhdGltIHdvdWxkIG1ha2UgYHJldHVybiAwYCA9PSBgZmFsc2VgID09IFNUT1AgZW51bWVyYXRpb24gKHRydW5jYXRlcyB0aGUKICB3aG9sZSBsaXN0aW5nKS4gRml4ZWQ6IGFjdG9yIHJldHVybnMgYGJvb2xgOyBoaWRlIHJldHVybnMgYHRydWVgIChza2lwICsgY29udGludWUpLAogIGVtaXQgcmV0dXJucyB0aGUgcmVhbCBhY3RvcidzIGJvb2wgcmVzdWx0LgotIC5pdGVyYXRlX3NoYXJlZCBpcyBzdGlsbCBhIHZhbGlkIHN0cnVjdCBmaWxlX29wZXJhdGlvbnMgbWVtYmVyIGluIDYuMTIgKHZlcmlmaWVkKS4KClJlYWRkaXIgZmlsdGVyIE9OTFkuIE5vIGRfcmV2YWxpZGF0ZSwgbm8gc19kX29wLCBubyBkZW50cnkgb3BzLiBTeXN0ZW0gcHJvY3MgKFVJRCA8IDEwMDAwKQpnZXQgc3RvY2sgZGNhY2hlX3JlYWRkaXIgKHplcm8gb3ZlcmhlYWQpLiBHdWFyZGVkIGJ5IENPTkZJR19LU1VfU1VTRlMuCgpWZXJpZmllZCBhZ2FpbnN0OgogIGZzL2RldnB0cy9pbm9kZS5jOiBzaW1wbGVfZGlyX29wZXJhdGlvbnMgQCBMNDU2LCBkZXZwdHNfZmlsbF9zdXBlciBAIEw0MjYsCiAgc2VxX2ZpbGUuaCBpbmNsdWRlIEAgTDI2LgoiIiIKCmltcG9ydCBzeXMKaW1wb3J0IGdsb2IKCmRlZiBwYXRjaF9kZXZwdHMoKToKICAgIHRhcmdldCA9IE5vbmUKICAgIGZvciBwYXQgaW4gWyJmcy9kZXZwdHMvaW5vZGUuYyIsICIqL2ZzL2RldnB0cy9pbm9kZS5jIl06CiAgICAgICAgbSA9IGdsb2IuZ2xvYihwYXQsIHJlY3Vyc2l2ZT1UcnVlKQogICAgICAgIGlmIG06CiAgICAgICAgICAgIHRhcmdldCA9IG1bMF0KICAgICAgICAgICAgYnJlYWsKICAgIGlmIG5vdCB0YXJnZXQ6CiAgICAgICAgcHJpbnQoIkVSUk9SOiBmcy9kZXZwdHMvaW5vZGUuYyBub3QgZm91bmQiKQogICAgICAgIHN5cy5leGl0KDEpCiAgICBwcmludChmIlBhdGNoaW5nOiB7dGFyZ2V0fSIpCgogICAgd2l0aCBvcGVuKHRhcmdldCkgYXMgZjoKICAgICAgICBjb250ZW50ID0gZi5yZWFkKCkKICAgIG9yaWdpbmFsID0gY29udGVudAoKICAgICMgMS4gY3JlZC5oIGFmdGVyIHNlcV9maWxlLmgKICAgIGFuY2hvcjEgPSAnI2luY2x1ZGUgPGxpbnV4L3NlcV9maWxlLmg+JwogICAgaWYgYW5jaG9yMSBub3QgaW4gY29udGVudDoKICAgICAgICBwcmludCgiRVJST1I6IHNlcV9maWxlLmggYW5jaG9yIG5vdCBmb3VuZCIpCiAgICAgICAgc3lzLmV4aXQoMSkKICAgIGlmICcjaW5jbHVkZSA8bGludXgvY3JlZC5oPicgbm90IGluIGNvbnRlbnQ6CiAgICAgICAgY29udGVudCA9IGNvbnRlbnQucmVwbGFjZShhbmNob3IxLCBhbmNob3IxICsgJ1xuI2luY2x1ZGUgPGxpbnV4L2NyZWQuaD4nLCAxKQoKICAgICMgMi4gSW5zZXJ0IGZpbHRlciBibG9jayBiZWZvcmUgZGV2cHRzX2ZpbGxfc3VwZXIuCiAgICAjICAgIDYuMTI6IGFjdG9yIGlzIGBib29sYCwgaGlkZSByZXR1cm5zIHRydWUgKGNvbnRpbnVlKSwgZW1pdCByZXR1cm5zIHJlYWwgYm9vbCByZXN1bHQuCiAgICBmaWx0ZXJfY29kZSA9IHInJycKI2lmZGVmIENPTkZJR19LU1VfU1VTRlMKc3RydWN0IGRldnB0c19maWx0ZXJfY3R4IHsKCXN0cnVjdCBkaXJfY29udGV4dCBjdHg7CglzdHJ1Y3QgZGlyX2NvbnRleHQgKnJlYWxfY3R4OwoJc3RydWN0IHN1cGVyX2Jsb2NrICpzYjsKfTsKCnN0YXRpYyBib29sIGRldnB0c19maWx0ZXJfYWN0b3Ioc3RydWN0IGRpcl9jb250ZXh0ICpjdHgsIGNvbnN0IGNoYXIgKm5hbWUsCgkJCQlpbnQgbmFtbGVuLCBsb2ZmX3Qgb2Zmc2V0LCB1NjQgaW5vLAoJCQkJdW5zaWduZWQgaW50IGRfdHlwZSkKewoJc3RydWN0IGRldnB0c19maWx0ZXJfY3R4ICpmY3R4ID0KCQljb250YWluZXJfb2YoY3R4LCBzdHJ1Y3QgZGV2cHRzX2ZpbHRlcl9jdHgsIGN0eCk7CgoJaWYgKG5hbWVbMF0gPT0gJy4nIHx8IChuYW1sZW4gPT0gNCAmJiAhbWVtY21wKG5hbWUsICJwdG14IiwgNCkpKQoJCWdvdG8gZW1pdDsKCglpZiAoZnJvbV9rdWlkKCZpbml0X3VzZXJfbnMsIGN1cnJlbnRfdWlkKCkpID49IDEwMDAwKSB7CgkJc3RydWN0IGlub2RlICppbm9kZSA9IGlsb29rdXAoZmN0eC0+c2IsIGlubyk7CgkJaWYgKGlub2RlKSB7CgkJCWJvb2wgaXNfcm9vdCA9IHVpZF9lcShpbm9kZS0+aV91aWQsIEdMT0JBTF9ST09UX1VJRCk7CgkJCWlwdXQoaW5vZGUpOwoJCQlpZiAoaXNfcm9vdCkKCQkJCXJldHVybiB0cnVlOyAvKiBoaWRlIHJvb3QgUFRZLCBDT05USU5VRSAoNi4xMiBib29sIGZpbGxkaXIpICovCgkJfQoJfQoKZW1pdDoKCWZjdHgtPnJlYWxfY3R4LT5wb3MgPSBmY3R4LT5jdHgucG9zOwoJcmV0dXJuIGZjdHgtPnJlYWxfY3R4LT5hY3RvcihmY3R4LT5yZWFsX2N0eCwgbmFtZSwgbmFtbGVuLAoJCQkJICAgICBvZmZzZXQsIGlubywgZF90eXBlKTsKfQoKc3RhdGljIGludCBkZXZwdHNfZmlsdGVyZWRfcmVhZGRpcihzdHJ1Y3QgZmlsZSAqZmlsZSwgc3RydWN0IGRpcl9jb250ZXh0ICpjdHgpCnsKCXN0cnVjdCBkZXZwdHNfZmlsdGVyX2N0eCBmY3R4ID0gewoJCS5jdHguYWN0b3IgPSBkZXZwdHNfZmlsdGVyX2FjdG9yLAoJCS5jdHgucG9zID0gY3R4LT5wb3MsCgkJLnJlYWxfY3R4ID0gY3R4LAoJCS5zYiA9IGZpbGVfaW5vZGUoZmlsZSktPmlfc2IsCgl9OwoJaW50IHJldDsKCglpZiAoZnJvbV9rdWlkKCZpbml0X3VzZXJfbnMsIGN1cnJlbnRfdWlkKCkpIDwgMTAwMDApCgkJcmV0dXJuIGRjYWNoZV9yZWFkZGlyKGZpbGUsIGN0eCk7CgoJcmV0ID0gZGNhY2hlX3JlYWRkaXIoZmlsZSwgJmZjdHguY3R4KTsKCWN0eC0+cG9zID0gZmN0eC5jdHgucG9zOwoJcmV0dXJuIHJldDsKfQoKc3RhdGljIGNvbnN0IHN0cnVjdCBmaWxlX29wZXJhdGlvbnMgZGV2cHRzX2Rpcl9vcGVyYXRpb25zID0gewoJLm9wZW4JCT0gZGNhY2hlX2Rpcl9vcGVuLAoJLnJlbGVhc2UJPSBkY2FjaGVfZGlyX2Nsb3NlLAoJLmxsc2VlawkJPSBkY2FjaGVfZGlyX2xzZWVrLAoJLnJlYWQJCT0gZ2VuZXJpY19yZWFkX2RpciwKCS5pdGVyYXRlX3NoYXJlZAk9IGRldnB0c19maWx0ZXJlZF9yZWFkZGlyLAoJLmZzeW5jCQk9IG5vb3BfZnN5bmMsCn07CiNlbmRpZgoKJycnCiAgICBhbmNob3IyID0gJ3N0YXRpYyBpbnRcbmRldnB0c19maWxsX3N1cGVyJwogICAgaWYgYW5jaG9yMiBub3QgaW4gY29udGVudDoKICAgICAgICBhbmNob3IyID0gJ3N0YXRpYyBpbnQgZGV2cHRzX2ZpbGxfc3VwZXInCiAgICBpZiBhbmNob3IyIG5vdCBpbiBjb250ZW50OgogICAgICAgIHByaW50KCJFUlJPUjogZGV2cHRzX2ZpbGxfc3VwZXIgbm90IGZvdW5kIikKICAgICAgICBzeXMuZXhpdCgxKQogICAgaWYgJ2RldnB0c19maWx0ZXJfYWN0b3InIG5vdCBpbiBjb250ZW50OgogICAgICAgIGNvbnRlbnQgPSBjb250ZW50LnJlcGxhY2UoYW5jaG9yMiwgZmlsdGVyX2NvZGUgKyBhbmNob3IyLCAxKQoKICAgICMgMy4gU3dhcCB0aGUgZGlyIGlfZm9wIGFzc2lnbm1lbnQgKENPTkZJRy1ndWFyZGVkKS4KICAgIGFuY2hvcjMgPSAnXHRpbm9kZS0+aV9mb3AgPSAmc2ltcGxlX2Rpcl9vcGVyYXRpb25zOycKICAgIGlmIGFuY2hvcjMgbm90IGluIGNvbnRlbnQ6CiAgICAgICAgcHJpbnQoIkVSUk9SOiBzaW1wbGVfZGlyX29wZXJhdGlvbnMgYXNzaWdubWVudCBub3QgZm91bmQiKQogICAgICAgIHN5cy5leGl0KDEpCiAgICByZXBsID0gKCcjaWZkZWYgQ09ORklHX0tTVV9TVVNGU1xuJwogICAgICAgICAgICAnXHRpbm9kZS0+aV9mb3AgPSAmZGV2cHRzX2Rpcl9vcGVyYXRpb25zO1xuJwogICAgICAgICAgICAnI2Vsc2VcbicKICAgICAgICAgICAgJ1x0aW5vZGUtPmlfZm9wID0gJnNpbXBsZV9kaXJfb3BlcmF0aW9ucztcbicKICAgICAgICAgICAgJyNlbmRpZicpCiAgICBjb250ZW50ID0gY29udGVudC5yZXBsYWNlKGFuY2hvcjMsIHJlcGwsIDEpCgogICAgaWYgY29udGVudCA9PSBvcmlnaW5hbDoKICAgICAgICBwcmludCgiRVJST1I6IG5vIGNoYW5nZXMgbWFkZSIpCiAgICAgICAgc3lzLmV4aXQoMSkKCiAgICB3aXRoIG9wZW4odGFyZ2V0LCAndycpIGFzIGY6CiAgICAgICAgZi53cml0ZShjb250ZW50KQoKICAgICMgVmVyaWZ5IOKAlCBpbmNsdWRpbmcgdGhlIGNyaXRpY2FsIDYuMTIgYm9vbCBzZW1hbnRpY3MuCiAgICBwID0gb3Blbih0YXJnZXQpLnJlYWQoKQogICAgY2hlY2tzID0gWwogICAgICAgICgnY3JlZC5oJywgJyNpbmNsdWRlIDxsaW51eC9jcmVkLmg+JyksCiAgICAgICAgKCduYW1lZCBzdHJ1Y3QnLCAnc3RydWN0IGRldnB0c19maWx0ZXJfY3R4IHsnKSwKICAgICAgICAoJ2Jvb2wgYWN0b3IgKDYuMTIpJywgJ3N0YXRpYyBib29sIGRldnB0c19maWx0ZXJfYWN0b3InKSwKICAgICAgICAoJ2hpZGUgcmV0dXJucyB0cnVlICg2LjEyKScsICdyZXR1cm4gdHJ1ZTsgLyogaGlkZSByb290IFBUWScpLAogICAgICAgICgnZmlsdGVyZWQgcmVhZGRpcicsICdkZXZwdHNfZmlsdGVyZWRfcmVhZGRpcicpLAogICAgICAgICgnZGlyIG9wcycsICdkZXZwdHNfZGlyX29wZXJhdGlvbnMnKSwKICAgICAgICAoJ2l0ZXJhdGVfc2hhcmVkIG1lbWJlcicsICcuaXRlcmF0ZV9zaGFyZWRcdD0gZGV2cHRzX2ZpbHRlcmVkX3JlYWRkaXInKSwKICAgICAgICAoJ0NPTkZJRyBndWFyZCcsICdDT05GSUdfS1NVX1NVU0ZTJyksCiAgICAgICAgKCdpbG9va3VwJywgJ2lsb29rdXAoZmN0eC0+c2IsIGlubyknKSwKICAgICAgICAoJ0dMT0JBTF9ST09UX1VJRCcsICdHTE9CQUxfUk9PVF9VSUQnKSwKICAgIF0KICAgIHNhZmV0eSA9IFsKICAgICAgICAoJ05PIGludCBhY3RvciByZXR1cm4gMCBoaWRlJywgJ3N0YXRpYyBpbnQgZGV2cHRzX2ZpbHRlcl9hY3Rvcicgbm90IGluIHApLAogICAgICAgICgnTk8gZF9yZXZhbGlkYXRlJywgJ2RfcmV2YWxpZGF0ZScgbm90IGluIHApLAogICAgICAgICgnTk8gY3VzdG9tIGRldnB0c19kZW50cnkgb3AnLCAnZGV2cHRzX2RlbnRyeScgbm90IGluIHApLAogICAgICAgICgnc3RvY2sgc19kX29wIHVudG91Y2hlZCcsICdzLT5zX2Rfb3AgPSAmc2ltcGxlX2RlbnRyeV9vcGVyYXRpb25zOycgaW4gcCksCiAgICAgICAgKCdOTyBMT09LVVBfUkNVJywgJ0xPT0tVUF9SQ1UnIG5vdCBpbiBwKSwKICAgICAgICAoJ05PIEVDSElMRCcsICdFQ0hJTEQnIG5vdCBpbiBwKSwKICAgICAgICAoJ3NpbXBsZV9kZW50cnlfb3BlcmF0aW9ucyB1bnRvdWNoZWQnLCAnc2ltcGxlX2RlbnRyeV9vcGVyYXRpb25zJyBpbiBwIG9yICdzaW1wbGVfZGlyX29wZXJhdGlvbnMnIGluIHApLAogICAgXQogICAgb2sgPSBUcnVlCiAgICBmb3IgbiwgbmVlZGxlIGluIGNoZWNrczoKICAgICAgICBnb29kID0gbmVlZGxlIGluIHAKICAgICAgICBvayA9IG9rIGFuZCBnb29kCiAgICAgICAgcHJpbnQoZiIgIFZlcmlmeSB7bn06IHsnT0snIGlmIGdvb2QgZWxzZSAnRkFJTCd9IikKICAgIGZvciBuLCBnb29kIGluIHNhZmV0eToKICAgICAgICBvayA9IG9rIGFuZCBnb29kCiAgICAgICAgcHJpbnQoZiIgIFNhZmV0eSB7bn06IHsnT0snIGlmIGdvb2QgZWxzZSAnRkFJTCd9IikKICAgIGlmIG5vdCBvazoKICAgICAgICBwcmludCgiRVJST1I6IHZlcmlmaWNhdGlvbiBmYWlsZWQiKQogICAgICAgIHN5cy5leGl0KDEpCiAgICBwcmludCgiZGV2cHRzIHBhdGNoIChPUDE1IDYuMTIsIGJvb2wgZmlsbGRpcikgY29tcGxldGUiKQoKCmlmIF9fbmFtZV9fID09ICdfX21haW5fXyc6CiAgICBwYXRjaF9kZXZwdHMoKQo=" | base64 -d > /tmp/p_devpts.py
+          python3 /tmp/p_devpts.py
+
+          # --- 8. /proc/net/unix filter ---
+          echo "IyEvdXNyL2Jpbi9lbnYgcHl0aG9uMwoiIiIKT1AxNSA2LjEyIC9wcm9jL25ldC91bml4IGZpbHRlcjogaGlkZSAvZGF0YS9hZGIvKiBwYXRobmFtZSBzb2NrZXRzIGZyb20gYXBwIFVJRHMuCgo2LjEyIEFEQVBUIHZzIFBhY21hbiA1LjE1OgotIDYuMTIgdW5peF9zZXFfc2hvdyBjb21wdXRlcyBwYXRoIGxlbmd0aCBhcwogICAgICBsZW4gPSB1LT5hZGRyLT5sZW4gLSBvZmZzZXRvZihzdHJ1Y3Qgc29ja2FkZHJfdW4sIHN1bl9wYXRoKTsKICAoUGFjbWFuIHVzZWQgYHUtPmFkZHItPmxlbiAtIHNpemVvZihzaG9ydCkgLSAxYCkuIFdlIHVzZSBvZmZzZXRvZiB0byBtYXRjaCA2LjEyLgotIElkZW50aWZ5IHBhdGhuYW1lIHNvY2tldHMgdmlhIGBzdW5fcGF0aFswXSA9PSAnLydgIGluc3RlYWQgb2YgdGhlIFVOSVhfQUJTVFJBQ1QKICBtYWNybyAocm9idXN0LCBubyBtYWNybyBkZXBlbmRlbmN5KS4KCkRpc3BsYXkgZmlsdGVyIE9OTFkuIExvY2sgaGVsZCBkdXJpbmcgY2hlY2ssIHJlbGVhc2VkIGJlZm9yZSB0aGUgU0VRX1NLSVAgZWFybHkgcmV0dXJuCihubyBkZWFkbG9jaykuIE5vIHN0cnVjdC9vcHMvZ2xvYmFsIGNoYW5nZXMuIEd1YXJkZWQgYnkgQ09ORklHX0tTVV9TVVNGUy4KClZlcmlmaWVkIGFnYWluc3Q6CiAgbmV0L3VuaXgvYWZfdW5peC5jOiB1bml4X3NlcV9zaG93IEAgTDM0MTIsIGFkZHIgbGVuIHVzZXMKICBvZmZzZXRvZihzdHJ1Y3Qgc29ja2FkZHJfdW4sIHN1bl9wYXRoKSBAIEwzNDQ4LgoiIiIKCmltcG9ydCBzeXMKaW1wb3J0IGdsb2IKClBBVENIX01BUktFUiA9ICdTVVNGUyBoaWRlIC9kYXRhL2FkYiBzb2NrZXRzJwoKRklMVEVSX0NPREUgPSAnJycKI2lmZGVmIENPTkZJR19LU1VfU1VTRlMKCQkvKiBTVVNGUyBoaWRlIC9kYXRhL2FkYiBzb2NrZXRzIGZyb20gL3Byb2MvbmV0L3VuaXggZm9yIGFwcCBVSURzICovCgkJaWYgKHUtPmFkZHIgJiYgdS0+YWRkci0+bmFtZS0+c3VuX3BhdGhbMF0gPT0gJy8nKSB7CgkJCXVpZF90IGZzdWlkID0gX19rdWlkX3ZhbChjdXJyZW50X2ZzdWlkKCkpOwoJCQlpZiAoZnN1aWQgPj0gMTAwMDApIHsKCQkJCWludCBwbGVuID0gdS0+YWRkci0+bGVuIC0KCQkJCQlvZmZzZXRvZihzdHJ1Y3Qgc29ja2FkZHJfdW4sIHN1bl9wYXRoKTsKCQkJCWNvbnN0IGNoYXIgKnNwYXRoID0gdS0+YWRkci0+bmFtZS0+c3VuX3BhdGg7CgkJCQlpZiAoKHBsZW4gPj0gMTAgJiYgc3RybmNtcChzcGF0aCwgIi9kYXRhL2FkYi8iLCAxMCkgPT0gMCkgfHwKCQkJCSAgICAocGxlbiA9PSA5ICYmIHN0cm5jbXAoc3BhdGgsICIvZGF0YS9hZGIiLCA5KSA9PSAwKSkgewoJCQkJCXVuaXhfc3RhdGVfdW5sb2NrKHMpOwoJCQkJCXJldHVybiBTRVFfU0tJUDsKCQkJCX0KCQkJfQoJCX0KI2VuZGlmCicnJwoKCmRlZiBmaW5kX2ZpbGUoKToKICAgIGZvciBwYXQgaW4gWyJuZXQvdW5peC9hZl91bml4LmMiLCAiKi9uZXQvdW5peC9hZl91bml4LmMiXToKICAgICAgICBtID0gZ2xvYi5nbG9iKHBhdCwgcmVjdXJzaXZlPVRydWUpCiAgICAgICAgaWYgbToKICAgICAgICAgICAgcmV0dXJuIG1bMF0KICAgIHJldHVybiBOb25lCgoKZGVmIHBhdGNoX2FmX3VuaXgoKToKICAgIHRhcmdldCA9IGZpbmRfZmlsZSgpCiAgICBpZiBub3QgdGFyZ2V0OgogICAgICAgIHByaW50KCJFUlJPUjogbmV0L3VuaXgvYWZfdW5peC5jIG5vdCBmb3VuZCIpCiAgICAgICAgc3lzLmV4aXQoMSkKICAgIHByaW50KGYiVGFyZ2V0OiB7dGFyZ2V0fSIpCgogICAgd2l0aCBvcGVuKHRhcmdldCkgYXMgZjoKICAgICAgICBjb250ZW50ID0gZi5yZWFkKCkKCiAgICBpZiBQQVRDSF9NQVJLRVIgaW4gY29udGVudDoKICAgICAgICBwcmludCgiQWxyZWFkeSBwYXRjaGVkLiBTa2lwcGluZy4iKQogICAgICAgIHJldHVybgoKICAgIGZvciBuZWVkbGUsIGRlc2MgaW4gWwogICAgICAgICgnc3RhdGljIGludCB1bml4X3NlcV9zaG93KHN0cnVjdCBzZXFfZmlsZSAqc2VxLCB2b2lkICp2KScsICd1bml4X3NlcV9zaG93JyksCiAgICAgICAgKCd1bml4X3N0YXRlX2xvY2socyk7JywgJ3VuaXhfc3RhdGVfbG9jaycpLAogICAgICAgICgnc3RydWN0IHVuaXhfc29jayAqdSA9IHVuaXhfc2socyk7JywgJ3VuaXhfc2sgZGVjbCcpLAogICAgICAgICgndW5peF9zdGF0ZV91bmxvY2socyk7JywgJ3VuaXhfc3RhdGVfdW5sb2NrJyksCiAgICAgICAgKCdvZmZzZXRvZihzdHJ1Y3Qgc29ja2FkZHJfdW4sIHN1bl9wYXRoKScsICc2LjEyIG9mZnNldG9mIGFkZHItbGVuIGZvcm0nKSwKICAgIF06CiAgICAgICAgaWYgbmVlZGxlIG5vdCBpbiBjb250ZW50OgogICAgICAgICAgICBwcmludChmIkVSUk9SOiBhbmNob3IgbWlzc2luZyAoe2Rlc2N9KToge25lZWRsZX0iKQogICAgICAgICAgICBzeXMuZXhpdCgxKQoKICAgICMgY3JlZC5oIGZvciBjdXJyZW50X2ZzdWlkKCkg4oCUIHRyeSBzZXZlcmFsIGFuY2hvcnMgcHJlc2VudCBpbiBhZl91bml4LmMuCiAgICBpZiAnI2luY2x1ZGUgPGxpbnV4L2NyZWQuaD4nIG5vdCBpbiBjb250ZW50OgogICAgICAgIGluc2VydGVkID0gRmFsc2UKICAgICAgICBmb3IgYW5jaG9yIGluIFsnI2luY2x1ZGUgPGxpbnV4L3NlY3VyaXR5Lmg+JywKICAgICAgICAgICAgICAgICAgICAgICAnI2luY2x1ZGUgPG5ldC9zb2NrLmg+JywKICAgICAgICAgICAgICAgICAgICAgICAnI2luY2x1ZGUgPGxpbnV4L21vZHVsZS5oPiddOgogICAgICAgICAgICBpZiBhbmNob3IgaW4gY29udGVudDoKICAgICAgICAgICAgICAgIGNvbnRlbnQgPSBjb250ZW50LnJlcGxhY2UoYW5jaG9yLCBhbmNob3IgKyAnXG4jaW5jbHVkZSA8bGludXgvY3JlZC5oPicsIDEpCiAgICAgICAgICAgICAgICBwcmludChmIiAgQWRkZWQgY3JlZC5oIGFmdGVyIHthbmNob3J9IikKICAgICAgICAgICAgICAgIGluc2VydGVkID0gVHJ1ZQogICAgICAgICAgICAgICAgYnJlYWsKICAgICAgICBpZiBub3QgaW5zZXJ0ZWQ6CiAgICAgICAgICAgIHByaW50KCJFUlJPUjogbm8gYW5jaG9yIGZvciBjcmVkLmggaW5jbHVkZSIpCiAgICAgICAgICAgIHN5cy5leGl0KDEpCgogICAgIyBJbmplY3QgYWZ0ZXIgdGhlIHVuaXhfc3RhdGVfbG9jayhzKSBpbnNpZGUgdW5peF9zZXFfc2hvdy4KICAgIGZ1bmNfc2lnID0gJ3N0YXRpYyBpbnQgdW5peF9zZXFfc2hvdyhzdHJ1Y3Qgc2VxX2ZpbGUgKnNlcSwgdm9pZCAqdiknCiAgICBmdW5jX3N0YXJ0ID0gY29udGVudC5pbmRleChmdW5jX3NpZykKICAgIGxvY2tfbmVlZGxlID0gJ1x0XHR1bml4X3N0YXRlX2xvY2socyk7JwogICAgbG9ja19wb3MgPSBjb250ZW50LmZpbmQobG9ja19uZWVkbGUsIGZ1bmNfc3RhcnQpCiAgICBpZiBsb2NrX3BvcyA9PSAtMToKICAgICAgICBsb2NrX25lZWRsZSA9ICd1bml4X3N0YXRlX2xvY2socyk7JwogICAgICAgIGxvY2tfcG9zID0gY29udGVudC5maW5kKGxvY2tfbmVlZGxlLCBmdW5jX3N0YXJ0KQogICAgaWYgbG9ja19wb3MgPT0gLTE6CiAgICAgICAgcHJpbnQoIkVSUk9SOiB1bml4X3N0YXRlX2xvY2socykgbm90IGZvdW5kIGluc2lkZSB1bml4X3NlcV9zaG93IikKICAgICAgICBzeXMuZXhpdCgxKQogICAgaWYgbG9ja19wb3MgLSBmdW5jX3N0YXJ0ID4gNjAwOgogICAgICAgIHByaW50KCJFUlJPUjogbG9jayBhbmNob3IgdG9vIGZhciBmcm9tIGZ1bmN0aW9uIHN0YXJ0IOKAlCB3cm9uZyBtYXRjaCIpCiAgICAgICAgc3lzLmV4aXQoMSkKCiAgICBsaW5lX2VuZCA9IGNvbnRlbnQuaW5kZXgoJ1xuJywgbG9ja19wb3MpCiAgICBjb250ZW50ID0gY29udGVudFs6bGluZV9lbmQgKyAxXSArIEZJTFRFUl9DT0RFICsgY29udGVudFtsaW5lX2VuZCArIDE6XQoKICAgICMgVmVyaWZ5OiB1bmxvY2sgYmVmb3JlIFNFUV9TS0lQIChubyBkZWFkbG9jayksIG1hcmtlcnMgcHJlc2VudC4KICAgIG1hcmtlcl9wb3MgPSBjb250ZW50LmluZGV4KFBBVENIX01BUktFUikKICAgIGJsb2NrID0gY29udGVudFttYXJrZXJfcG9zOm1hcmtlcl9wb3MgKyA2MDBdCiAgICB1bmxvY2tfYXQgPSBibG9jay5maW5kKCd1bml4X3N0YXRlX3VubG9jayhzKScpCiAgICBza2lwX2F0ID0gYmxvY2suZmluZCgncmV0dXJuIFNFUV9TS0lQJykKICAgIGVycm9ycyA9IFtdCiAgICBpZiBQQVRDSF9NQVJLRVIgbm90IGluIGNvbnRlbnQ6CiAgICAgICAgZXJyb3JzLmFwcGVuZCgibWFya2VyIG1pc3NpbmciKQogICAgaWYgdW5sb2NrX2F0ID09IC0xIG9yIHNraXBfYXQgPT0gLTE6CiAgICAgICAgZXJyb3JzLmFwcGVuZCgidW5sb2NrL1NFUV9TS0lQIG1pc3NpbmcgaW4gYmxvY2siKQogICAgZWxpZiB1bmxvY2tfYXQgPiBza2lwX2F0OgogICAgICAgIGVycm9ycy5hcHBlbmQoIkRFQURMT0NLOiB1bmxvY2sgQUZURVIgU0VRX1NLSVAiKQogICAgaWYgY29udGVudC5jb3VudCgndW5peF9zdGF0ZV91bmxvY2socyk7JykgPCAyOgogICAgICAgIGVycm9ycy5hcHBlbmQoIm9yaWdpbmFsIHVubG9jayByZW1vdmVkIikKICAgIGlmICcjaW5jbHVkZSA8bGludXgvY3JlZC5oPicgbm90IGluIGNvbnRlbnQ6CiAgICAgICAgZXJyb3JzLmFwcGVuZCgiY3JlZC5oIG1pc3NpbmciKQogICAgaWYgJ29mZnNldG9mKHN0cnVjdCBzb2NrYWRkcl91biwgc3VuX3BhdGgpJyBub3QgaW4gY29udGVudFttYXJrZXJfcG9zOm1hcmtlcl9wb3MrNjAwXToKICAgICAgICBlcnJvcnMuYXBwZW5kKCJvZmZzZXRvZiBmb3JtIG1pc3NpbmcgaW4gaW5qZWN0ZWQgYmxvY2siKQogICAgaWYgJ2N1cnJlbnRfZnN1aWQoKScgbm90IGluIGNvbnRlbnQ6CiAgICAgICAgZXJyb3JzLmFwcGVuZCgiY3VycmVudF9mc3VpZCBtaXNzaW5nIikKICAgIGlmIGVycm9yczoKICAgICAgICBwcmludCgiVkVSSUZJQ0FUSU9OIEZBSUxFRDoiKQogICAgICAgIGZvciBlIGluIGVycm9yczoKICAgICAgICAgICAgcHJpbnQoZiIgIHtlfSIpCiAgICAgICAgc3lzLmV4aXQoMSkKCiAgICB3aXRoIG9wZW4odGFyZ2V0LCAndycpIGFzIGY6CiAgICAgICAgZi53cml0ZShjb250ZW50KQogICAgcHJpbnQoImFmX3VuaXguYzogL3Byb2MvbmV0L3VuaXggZmlsdGVyIChPUDE1IDYuMTIsIG9mZnNldG9mIGZvcm0pIGNvbXBsZXRlIikKCgppZiBfX25hbWVfXyA9PSAiX19tYWluX18iOgogICAgcGF0Y2hfYWZfdW5peCgpCg==" | base64 -d > /tmp/p_procnetunix.py
+          python3 /tmp/p_procnetunix.py
+
+          # --- CI safety: every hook must be present ---
+          grep -q "SukiSU Cloak" fs/namei.c || { echo "FATAL: namei hook missing"; exit 1; }
+          grep -q "SukiSU Cloak" fs/open.c || { echo "FATAL: open hook missing"; exit 1; }
+          grep -q "Hide KSU/SUSFS/KPM" kernel/kallsyms.c || { echo "FATAL: kallsyms hook missing"; exit 1; }
+          grep -q "stealth_config" kernel/Makefile || { echo "FATAL: ikconfig hook missing"; exit 1; }
+          grep -q "DirtySepolicy Cloak v11" security/selinux/selinuxfs.c || { echo "FATAL: dirtysepolicy hook missing"; exit 1; }
+          grep -q "devpts_filter_actor" fs/devpts/inode.c || { echo "FATAL: devpts hook missing"; exit 1; }
+          grep -q "SUSFS hide /data/adb sockets" net/unix/af_unix.c || { echo "FATAL: procnetunix hook missing"; exit 1; }
+          echo "All 7 stealth hooks verified present."
+          cd "$WORKDIR"
+
+      - name: Build kernel
+        run: |
+          set -euo pipefail
+          cd "$WORKDIR/common"
+
+          export TZ=UTC
+          export LC_ALL=C
+          export SOURCE_DATE_EPOCH=1764900355   # stock .300: Fri Dec  5 02:05:55 UTC 2025
+          export KBUILD_BUILD_TIMESTAMP="$(date -u -d @$SOURCE_DATE_EPOCH '+%a %b %e %T UTC %Y')"
+          export KBUILD_BUILD_USER=kleaf        # stock /proc/version: (kleaf@build-host)
+          export KBUILD_BUILD_HOST=build-host
+          export KBUILD_BUILD_VERSION=1
+          export KBUILD_GENDWARFKSYMS_STABLE=1
+          export LIBCLANG_PATH="$WORKDIR/clang19/lib"
+
+          echo "=== Build environment ==="
+          echo "KBUILD_GENDWARFKSYMS_STABLE=$KBUILD_GENDWARFKSYMS_STABLE"
+          echo "SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH"
+          echo "KBUILD_BUILD_TIMESTAMP=$KBUILD_BUILD_TIMESTAMP"
+
+          ROOT_REAL_PATH="$WORKDIR"
+          MAP_FLAGS="-fdebug-prefix-map=$ROOT_REAL_PATH=. -fmacro-prefix-map=$ROOT_REAL_PATH=. -ffile-prefix-map=$ROOT_REAL_PATH=."
+
+          KCFLAGS="$MAP_FLAGS -no-canonical-prefixes -Wno-error -D__ANDROID_COMMON_KERNEL__"
+          KCPPFLAGS="$MAP_FLAGS -D__ANDROID_COMMON_KERNEL__"
+
+          MAKE_ARGS=(
+            LLVM=1
+            LLVM_IAS=1
+            ARCH=arm64
+            CROSS_COMPILE=aarch64-linux-gnu-
+            CC="clang"
+            LD="ld.lld"
+            AR="llvm-ar"
+            NM="llvm-nm"
+            OBJCOPY="llvm-objcopy"
+            OBJDUMP="llvm-objdump"
+            STRIP="llvm-strip"
+            HOSTCC="clang"
+            HOSTCXX="clang++"
+            HOSTLD="ld.lld"
+            KCFLAGS="$KCFLAGS"
+            KCPPFLAGS="$KCPPFLAGS"
+          )
+
+          command -v rustc &>/dev/null && MAKE_ARGS+=(RUSTC="$(command -v rustc)")
+          command -v bindgen &>/dev/null && MAKE_ARGS+=(BINDGEN="$(command -v bindgen)")
+          command -v pahole &>/dev/null && MAKE_ARGS+=(PAHOLE="$(command -v pahole)")
+
+          echo "=== Build start: $(date -u) ==="
+
+          make -j"$(nproc)" O=out "${MAKE_ARGS[@]}" gki_defconfig
+
+          make O=out "${MAKE_ARGS[@]}" rustavailable || { echo "FATAL: Rust toolchain check failed"; exit 1; }
+
+          make -j"$(nproc)" O=out "${MAKE_ARGS[@]}" olddefconfig
+
+          # Enforce required base config (same as Build 1)
+          REQUIRED=(
+            "CONFIG_MODULES=y"
+            "CONFIG_MODVERSIONS=y"
+            "CONFIG_GENDWARFKSYMS=y"
+            "CONFIG_RUST=y"
+            "CONFIG_DEBUG_INFO_BTF=y"
+          )
+          for symbol in "${REQUIRED[@]}"; do
+            grep -qx "$symbol" out/.config || { echo "FATAL: missing $symbol"; exit 1; }
+          done
+
+          # Enforce KSU + SUSFS present
+          grep -qx "CONFIG_KSU=y" out/.config || { echo "FATAL: CONFIG_KSU=y not in built config"; exit 1; }
+          grep -qx "CONFIG_KSU_SUSFS=y" out/.config || { echo "FATAL: CONFIG_KSU_SUSFS=y not in built config"; exit 1; }
+
+          # Enforce KPM disabled
+          if grep -qx "CONFIG_KPM=y" out/.config; then
+            echo "FATAL: CONFIG_KPM=y found - must be disabled"
+            exit 1
+          fi
+
+          echo "=== KSU/SUSFS config in built .config ==="
+          grep -E '^CONFIG_KSU|^CONFIG_KPM|^CONFIG_KSU_SUSFS' out/.config || true
+          echo "Config validated"
+
+          KERNELRELEASE=$(make -s O=out "${MAKE_ARGS[@]}" kernelrelease)
+          echo "=== Kernel release: $KERNELRELEASE ==="
+          echo "=== Stock .300:     6.12.23-android16-5-gb2a876903b49-ab14541642-4k ==="
+          EXPECTED_RELEASE="6.12.23-android16-5-gb2a876903b49-ab14541642-4k"
+          if [ "$KERNELRELEASE" != "$EXPECTED_RELEASE" ]; then
+            echo "FATAL: kernelrelease does not match stock .300 - /proc/version would mismatch uname"
+            echo "  got:      $KERNELRELEASE"
+            echo "  expected: $EXPECTED_RELEASE"
+            exit 1
+          fi
+          echo "kernelrelease matches stock .300 exactly: $KERNELRELEASE"
+          echo "KERNELRELEASE=$KERNELRELEASE" >> "$GITHUB_ENV"
+
+          make -j"$(nproc)" O=out "${MAKE_ARGS[@]}" Image 2>&1 | tee build.log
+          test "${PIPESTATUS[0]}" -eq 0 || { echo "FATAL: build failed"; grep -i "error:" build.log | tail -50; exit 1; }
+
+          test -s out/arch/arm64/boot/Image || { echo "FATAL: Image not produced"; exit 1; }
+          test -s out/vmlinux.symvers || { echo "FATAL: vmlinux.symvers missing"; exit 1; }
+
+          echo "=== Build end: $(date -u) ==="
+          IMAGE_SIZE=$(stat -c%s out/arch/arm64/boot/Image)
+          echo "Image: $IMAGE_SIZE bytes"
+          echo "Build 1 Image: 40348160 bytes; Build 2 Image: 40548864 bytes (Build 3 must be >= Build 2)"
+
+          # Size sanity: Build 2 should be larger than Build 1 (added KSU+SUSFS code)
+          # but not absurdly so. Alert if smaller (code dropped) or >50% larger.
+          if [ "$IMAGE_SIZE" -lt 39000000 ]; then
+            echo "WARNING: Image significantly smaller than Build 1 - possible code drop"
+          fi
+          if [ "$IMAGE_SIZE" -gt 60000000 ]; then
+            echo "WARNING: Image significantly larger than expected"
+          fi
+
+          sha256sum out/arch/arm64/boot/Image
+          df -h /
+
+      - name: Collect artifacts
+        run: |
+          set -euo pipefail
+          cd "$WORKDIR/common"
+          mkdir -p "$WORKDIR/artifacts"
+
+          cp out/arch/arm64/boot/Image "$WORKDIR/artifacts/"
+          cp out/.config "$WORKDIR/artifacts/kernel_built_config"
+          cp out/vmlinux.symvers "$WORKDIR/artifacts/"
+          cp out/System.map "$WORKDIR/artifacts/" 2>/dev/null || true
+          cp out/modules.builtin "$WORKDIR/artifacts/" 2>/dev/null || true
+          cp out/modules.builtin.modinfo "$WORKDIR/artifacts/" 2>/dev/null || true
+          tail -500 build.log > "$WORKDIR/artifacts/build_tail.log"
+
+          SUSFS_VER=$(grep -oP 'SUSFS_VERSION\s+"[^"]+"' include/linux/susfs.h 2>/dev/null | head -1 || echo "unknown")
+
+          cat > "$WORKDIR/artifacts/BUILD_INFO.txt" << INFOEOF
+          Source: ${{ env.SOURCE_REPO }}
+          Branch: ${{ env.SOURCE_BRANCH }}
+          Commit: ${{ env.SOURCE_SHA }}
+          Kernelrelease: ${{ env.KERNELRELEASE }}
+          Stock .300: 6.12.23-android16-5-gb2a876903b49-ab14541642-4k
+          Clang: $(clang --version | head -1)
+          Rustc: $(rustc --version 2>/dev/null)
+          KBUILD_GENDWARFKSYMS_STABLE: 1
+          Image size: $(stat -c%s "$WORKDIR/artifacts/Image") bytes
+          Build date: $(date -u)
+          Method: make gki_defconfig + make Image (direct GKI)
+          SukiSU: Ultra builtin
+          SUSFS: $SUSFS_VER
+          KPM: disabled
+          BBG: not installed
+          INFOEOF
+
+          cd "$WORKDIR/artifacts"
+          sha256sum * | tee SHA256SUMS.txt
+          ls -la
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: op15-build3-stealth-kernel
+          path: ${{ github.workspace }}/kernel_workspace/artifacts/*
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: op15-build3-full-log
+          path: ${{ github.workspace }}/kernel_workspace/common/build.log
+          retention-days: 14
+          if-no-files-found: warn
+
