@@ -13,7 +13,7 @@ env:
   SOURCE_SHA: d9053b907db4bb5da938e9cf947d0ae32302ceaf
   SOURCE_BRANCH: oneplus/sm8850_b_16.0.0_oneplus_15
   TOOLCHAIN_BASE: https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang19-r536225
-  SUKISU_SHA: 7cd3be6187d464784ba96644b44fad085477d753
+  SUKISU_SHA: b88403d2561b6e00dff84a3c851e630c62f57fd0
   SUSFS_SHA: 72bdce7ce2de8189efb227c6cefbc578a9efd479
 
 defaults:
@@ -130,13 +130,11 @@ jobs:
           set -euo pipefail
           cd "$WORKDIR"
 
-          # --- 1. SukiSU Ultra (pinned commit) ---
-          # CRITICAL: run setup.sh from WORKDIR (parent of common/), NOT from inside
-          # common/. setup.sh detects common/drivers and places KernelSU as a SIBLING
-          # of common ($WORKDIR/KernelSU). This is the proven layout used by zh_build,
-          # bouteillepleine, etc. Running it from inside common/ puts KernelSU inside
-          # the compiled source tree and breaks the uapi symlink include resolution.
-          echo "=== Installing SukiSU Ultra @ $SUKISU_SHA (from WORKDIR) ==="
+          # --- 1. SukiSU Ultra builtin (pinned) ---
+          # builtin branch has SUSFS Kconfig + correct includes (no uapi-split problem
+          # that main/7cd3be6 has). Run setup.sh from WORKDIR so KernelSU is a sibling
+          # of common (proven layout: numbersf, zh).
+          echo "=== Installing SukiSU Ultra @ $SUKISU_SHA (builtin, from WORKDIR) ==="
           test -d common/drivers || { echo "FATAL: common/drivers missing"; exit 1; }
           curl --fail --retry 3 --retry-delay 5 -LSs \
             "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/$SUKISU_SHA/kernel/setup.sh" \
@@ -162,6 +160,30 @@ jobs:
           KSU_VERSION=$(cd KernelSU && git rev-list --count HEAD 2>/dev/null || echo "unknown")
           echo "KSU commit count: $KSU_VERSION"
 
+          # --- 2. Fix lsm_hook.c for 6.12 (the ONLY builtin blocker) ---
+          # 6.12 changed security_add_hooks 3rd arg from const char* to const struct lsm_id*.
+          # Under CONFIG_KSU_SUSFS, ksu_hooks[] is empty (key_permission HISI-only,
+          # task_fix_setuid is #ifndef SUSFS), so skip the empty registration entirely.
+          # ksu_handle_setresuid() stays in the file (still compiled). Verified: this was
+          # the single compile error in the first builtin build; 50_add_susfs applied clean.
+          LSM="KernelSU/kernel/hook/lsm_hook.c"
+          test -f "$LSM" || { echo "FATAL: lsm_hook.c not found"; exit 1; }
+          python3 - "$LSM" << 'PYEOF'
+          import sys
+          f = sys.argv[1]
+          s = open(f).read()
+          old = '#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0)\n    security_add_hooks(ksu_hooks, ARRAY_SIZE(ksu_hooks), "ksu");\n#else\n    // https://elixir.bootlin.com/linux/v4.10.17/source/include/linux/lsm_hooks.h#L1892\n    security_add_hooks(ksu_hooks, ARRAY_SIZE(ksu_hooks));\n#endif'
+          new = '#ifndef CONFIG_KSU_SUSFS\n#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0)\n    security_add_hooks(ksu_hooks, ARRAY_SIZE(ksu_hooks), "ksu");\n#else\n    security_add_hooks(ksu_hooks, ARRAY_SIZE(ksu_hooks));\n#endif\n#endif'
+          n = s.count(old)
+          if n != 1:
+              print("FATAL: expected exactly 1 security_add_hooks block, found", n)
+              sys.exit(1)
+          open(f, 'w').write(s.replace(old, new, 1))
+          print("lsm_hook.c 6.12 SUSFS guard applied")
+          PYEOF
+          grep -q "^#ifndef CONFIG_KSU_SUSFS" "$LSM" || { echo "FATAL: lsm guard not applied"; exit 1; }
+          cd "$WORKDIR"
+
           # --- 3. SUSFS (pinned commit on gki-android16-6.12) ---
           echo "=== Cloning SUSFS @ $SUSFS_SHA ==="
           git clone https://gitlab.com/simonpunk/susfs4ksu.git \
@@ -183,104 +205,9 @@ jobs:
           test -f susfs4ksu/kernel_patches/include/linux/susfs.h \
             || { echo "FATAL: susfs.h not found"; exit 1; }
 
-          # --- 3b. Apply SUSFS KernelSU integration patch ---
-          # Adds SUSFS Kconfig, Kbuild changes (removes lsm_hook.o), susfs_init() wiring,
-          # SELinux SID helpers, sucompat changes. Designed for KSU main branch structure.
-          echo "=== Applying 10_enable_susfs_for_ksu.patch to KernelSU ==="
-          test -f susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch \
-            || { echo "FATAL: 10_enable_susfs_for_ksu.patch not found"; exit 1; }
-          cp susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch KernelSU/
-          cd KernelSU
-
-          # 21/29 files are exact blob matches. 7/8 mismatches apply with fuzz=3.
-          # core/init.c will reject (SukiSU adds uts_spoof.h + spoof_release params).
-          # Apply with || true, then fix init.c rejects manually.
-          patch -p1 --fuzz=3 < 10_enable_susfs_for_ksu.patch || true
-
-          # Show what rejected
-          REJECTS=$(find . -name "*.rej" -print)
-          if [ -n "$REJECTS" ]; then
-            echo "=== Rejected files ==="
-            echo "$REJECTS"
-            for r in $REJECTS; do echo "--- $r ---"; cat "$r"; done
-          fi
-
-          # Fix core/init.c rejects manually — the patch expects tiann's init.c
-          # but SukiSU-Ultra 7cd3be6 has extra uts_spoof.h + spoof module_params.
-          INIT="kernel/core/init.c"
-          if [ -f "$INIT.rej" ]; then
-            echo "=== Fixing init.c rejects ==="
-
-            # 1. Add susfs.h include if not already added by patch
-            grep -q '#include <linux/susfs.h>' "$INIT" \
-              || sed -i '/#include <linux\/moduleparam.h>/a #include <linux/susfs.h>' "$INIT"
-
-            # 2. Remove old hook includes (keep uts_spoof.h)
-            sed -i '/#include "hook\/syscall_hook_manager.h"/d' "$INIT"
-            sed -i '/#include "hook\/lsm_hook.h"/d' "$INIT"
-            sed -i '/#include "hook\/syscall_hook.h"/d' "$INIT"
-            sed -i '/#include "infra\/symbol_resolver.h"/d' "$INIT"
-
-            # 3. Add new includes if not already present
-            grep -q '#include "hook/setuid_hook.h"' "$INIT" \
-              || sed -i '/#include "feature\/adb_root.h"/a #include "hook/setuid_hook.h"' "$INIT"
-            grep -q '#include "feature/sucompat.h"' "$INIT" \
-              || sed -i '/#include "hook\/setuid_hook.h"/a #include "feature/sucompat.h"' "$INIT"
-
-            # 4. Remove x86_64 indirect syscall block if still present
-            sed -i '/#if defined(__x86_64__)/,/#endif/{ /#if defined(__x86_64__)/d; /X86_FEATURE_INDIRECT_SAFE/d; /#error.*FATAL.*indirect/d; /#endif/d; /cpufeature/d; /linux\/version/d; /#ifndef/d }' "$INIT"
-
-            # 5. Remove old hook init calls
-            sed -i '/ksu_init_symbol_resolver();/d' "$INIT"
-            sed -i '/ksu_syscall_hook_init();/d' "$INIT"
-            sed -i '/ksu_lsm_hook_init();/d' "$INIT"
-
-            # 6. Add susfs_init() after ksu_feature_init() if not already present
-            grep -q 'susfs_init()' "$INIT" \
-              || sed -i '/ksu_feature_init();/a \\n#ifdef CONFIG_KSU_SUSFS\n\tsusfs_init();\n#endif' "$INIT"
-
-            # 7. Add sucompat/setuid hook inits if not already present
-            grep -q 'ksu_sucompat_init();' "$INIT" \
-              || sed -i '/ksu_supercalls_init();/a \    ksu_sucompat_init();' "$INIT"
-            grep -q 'ksu_setuid_hook_init();' "$INIT" \
-              || sed -i '/ksu_sucompat_init();/a \    ksu_setuid_hook_init();' "$INIT"
-
-            # 8. Remove old hook manager/lsm init+exit calls
-            sed -i '/ksu_syscall_hook_manager_init();/d' "$INIT"
-            sed -i '/ksu_syscall_hook_manager_exit();/d' "$INIT"
-            sed -i '/ksu_lsm_hook_exit();/d' "$INIT"
-
-            rm -f "$INIT.rej" "$INIT.orig"
-            echo "init.c rejects fixed"
-          fi
-
-          # Fail on any unhandled reject
-          REMAINING_REJECTS=$(find . -name "*.rej" -print)
-          if [ -n "$REMAINING_REJECTS" ]; then
-            echo "FATAL: unhandled patch rejects remain"
-            echo "$REMAINING_REJECTS"
-            for r in $REMAINING_REJECTS; do echo "--- $r ---"; cat "$r"; done
-            exit 1
-          fi
-          find . -name "*.orig" -delete 2>/dev/null || true
-
-          # Verify full SUSFS/SukiSU integration
-          echo "=== Verify SUSFS integration ==="
-          grep -q "susfs_init();" "$INIT" || { echo "FATAL: susfs_init missing"; exit 1; }
-          grep -q "ksu_sucompat_init();" "$INIT" || { echo "FATAL: ksu_sucompat_init missing"; exit 1; }
-          grep -q "ksu_setuid_hook_init();" "$INIT" || { echo "FATAL: ksu_setuid_hook_init missing"; exit 1; }
-          grep -q "ksu_syscall_hook_manager_init();" "$INIT" && { echo "FATAL: old syscall hook manager init still present"; exit 1; }
-          grep -q "ksu_syscall_hook_manager_exit();" "$INIT" && { echo "FATAL: old syscall hook manager exit still present"; exit 1; }
-          grep -q "ksu_lsm_hook_init();" "$INIT" && { echo "FATAL: old lsm init still present"; exit 1; }
-          grep -q "ksu_lsm_hook_exit();" "$INIT" && { echo "FATAL: old lsm exit still present"; exit 1; }
-          grep -q "config KSU_SUSFS" kernel/Kconfig || { echo "FATAL: SUSFS Kconfig missing"; exit 1; }
-          grep -q "lsm_hook.o" kernel/Kbuild && { echo "FATAL: lsm_hook.o still in Kbuild"; exit 1; }
-          echo "SUSFS integration verified"
-
-          rm -f 10_enable_susfs_for_ksu.patch
-          cd "$WORKDIR"
-
-          # --- 3c. Apply SUSFS kernel-level patch ---
+          # --- 3b. Apply SUSFS kernel-level patch (50_add_susfs) to common/ ONLY ---
+          # SukiSU Ultra has SUSFS built in — do NOT apply 10_enable (that's for tiann KSU).
+          # Verified clean against OnePlus 6.12 in first builtin build (all hunks succeeded).
           cp susfs4ksu/kernel_patches/fs/susfs.c common/fs/
           cp susfs4ksu/kernel_patches/include/linux/susfs.h common/include/linux/
           cp susfs4ksu/kernel_patches/include/linux/susfs_def.h common/include/linux/
